@@ -1,0 +1,7 @@
+.venv
+prevenv
+.env
+graph.pkl
+tags.jsonl
+sample.txt
+testRepos
