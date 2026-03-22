@@ -4,7 +4,10 @@ import json
 import networkx as nx
 import os
 from e2b_code_interpreter import Sandbox
+from dotenv import load_dotenv
+import time
 
+load_dotenv()
 #CHANGE read_local_file. FILE PATH IS HARDCODED RN
 
 def search_repo_advanced(search_term, graph_path='graph.pkl', tags_path='tags.jsonl'):
@@ -253,9 +256,20 @@ def setup_developer_environment(repo_url: str):
     sandbox = Sandbox.create(timeout=3000) # This creates the remote Linux environment
     
     print(f"📦 Cloning repository {repo_url} into Sandbox...")
+    depth = 5
+    gitHash = "15f56f3b0006d2ed2c29bde3c43e91618012c849"
     # Clone the repo. We use run_remote_command so we can see if it worked!
-    clone_result = run_remote_command(sandbox, f"git clone {repo_url} workspace/repo")
+    clone_result = run_remote_command(sandbox, f"git clone --depth {depth} {repo_url} workspace/repo")
+    clone_result = run_remote_command(sandbox, f"cd workspace/repo && git fetch --depth {depth} origin {gitHash}")
+    clone_result = run_remote_command(sandbox, f"cd workspace/repo && git checkout {gitHash}")
+    while("fatal" in clone_result):
+        time.sleep(30)
+        clone_result = run_remote_command(sandbox, f"cd workspace/repo && git fetch --depth {depth} origin {gitHash}")
+        clone_result = run_remote_command(sandbox, f"cd workspace/repo && git checkout {gitHash}")
+        depth += 5
+        # clone_result = run_remote_command(sandbox, f"cd workspace/repo && git checkout {gitHash}")
     print(clone_result)
+
     
     # Optional: If you are testing the 'requests' repo, you might need to install it
     # print("⚙️  Installing dependencies...")
@@ -312,3 +326,10 @@ def extract_final_plan(text):
     if marker in text:
         return text.split(marker, 1)[1].strip()
     return None
+
+
+# sandbox = setup_developer_environment('https://github.com/psf/black')
+# res = sandbox.commands.run("cd workspace/repo && find . -type f -name '*.py' | grep -v __pycache__ | sort")
+# print(res)
+# readme = run_remote_command(sandbox, "cd workspace/repo && cat README.md 2>/dev/null | head -50")
+# print(readme)
