@@ -1,5 +1,5 @@
 from tools import checkpoint_gate
-from llm_utils import run_agent_loop, get_agent_explanation
+from llm_utils import run_agent_loop, summarize_failure
 from sandbox_utils import parse_and_execute, run_remote_command
 
 
@@ -116,12 +116,7 @@ def run_implementer(architect_plan: str, test_result: dict, env_summary: str,
             return None
 
         elif decision["status"] == "TAKEOVER":
-            explanation = get_agent_explanation(
-            messages       = msgs,
-            model          = model,  # needs to be in scope — pass via closure
-            agent_name     = "🧠 Architect",
-            failure_reason = "checkpoint_rejected"  # not a loop — human rejected it
-        )
+            explanation = summarize_failure(messages, model, "implementer", True)
             return f"TAKEOVER_TRIGGERED::{explanation}"
 
         return git_diff
@@ -138,8 +133,8 @@ def run_implementer(architect_plan: str, test_result: dict, env_summary: str,
         env               = env,
     )
 
-    if result == "TAKEOVER_TRIGGERED":
-        return {"status": "failed", "content": "Takeover triggered."}
+    if "TAKEOVER_TRIGGERED" in result:
+        return {"status": "failed", "content": result}
     if result in ("TIMEOUT", ""):
         return {"status": "failed", "content": "Implementer timed out without completing the fix."}
 

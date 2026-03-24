@@ -1,5 +1,5 @@
 from tools import checkpoint_gate
-from llm_utils import run_agent_loop, get_agent_explanation
+from llm_utils import run_agent_loop, summarize_failure
 from sandbox_utils import parse_and_execute, detect_custom_test_infrastructure
 
 TEST_WRITER_SYSTEM_PROMPT = """
@@ -165,12 +165,7 @@ def run_test_writer(architect_plan: str, user_issue: str, env_summary: str, env:
             return None
 
         elif decision["status"] == "TAKEOVER":
-            explanation = get_agent_explanation(
-            messages       = msgs,
-            model          = model,  # needs to be in scope — pass via closure
-            agent_name     = "🧠 Architect",
-            failure_reason = "checkpoint_rejected"  # not a loop — human rejected it
-        )
+            explanation = summarize_failure(messages, model, "test_writer", True)
             return f"TAKEOVER_TRIGGERED::{explanation}"
 
         result_holder["result"] = raw_reply
@@ -189,14 +184,14 @@ def run_test_writer(architect_plan: str, user_issue: str, env_summary: str, env:
         is_complex        = infra["is_complex"]
     )
 
-    if result == "TAKEOVER_TRIGGERED":
-        return {"status": "failed", "content": "Takeover triggered."}
-    if result in ("TIMEOUT", ""):
-        return {"status": "failed", "content": "Test writer timed out without a failing test."}
 
     # Extract test file and command from the FINAL_RESULT block
     test_file    = _extract_field(result, "TEST_FILE:")
     test_command = _extract_field(result, "TEST_COMMAND:")
+    if "TAKEOVER_TRIGGERED" in result:
+        return {"status": "failed", "content": result}
+    if result in ("TIMEOUT", ""):
+        return {"status": "failed", "content": "Test writer timed out without a failing test."}
 
     return {
         "status":       "success",

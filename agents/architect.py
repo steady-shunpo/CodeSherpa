@@ -1,5 +1,5 @@
 from tools import search_repo_advanced, read_local_file, checkpoint_gate
-from llm_utils import run_agent_loop, call_llm, run_agent_loop_arch, get_agent_explanation
+from llm_utils import run_agent_loop, call_llm, run_agent_loop_arch, summarize_failure
 from sandbox_utils import parse_and_execute
 import re
 import subprocess
@@ -143,12 +143,7 @@ def run_architect(user_issue: str, max_iterations: int = 20) -> dict:
             return None  # signals loop to keep going
 
         elif decision["status"] == "TAKEOVER":
-            explanation = get_agent_explanation(
-            messages       = msgs,
-            model          = model,  # needs to be in scope — pass via closure
-            agent_name     = "🧠 Architect",
-            failure_reason = "checkpoint_rejected"  # not a loop — human rejected it
-        )
+            explanation = summarize_failure(messages, model, "architect", False)
             final_plan_holder["takeover"] = True
             return f"TAKEOVER_TRIGGERED::{explanation}"
 
@@ -167,7 +162,7 @@ def run_architect(user_issue: str, max_iterations: int = 20) -> dict:
         on_done         = on_done,
     )
 
-    if result == "TAKEOVER_TRIGGERED":
+    if "TAKEOVER_TRIGGERED" in result:
         return {"status": "failed", "content": "Takeover triggered.", "result": result}
     if result in ("TIMEOUT", ""):
         return {"status": "failed", "content": f"Architect timed out. Last message:\n{messages[-1]['content']}"}

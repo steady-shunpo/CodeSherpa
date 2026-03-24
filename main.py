@@ -61,6 +61,8 @@ def run_pipeline(user_issue: str, repo_url: str) -> dict:
 # """}
     if arch_result["status"] != "success":
         print(f"❌ Architect failed: {arch_result['content']}")
+        if "TAKEOVER" in arch_result['content']:
+            print(arch_result['content'])
         return {"status": "failed", "stage": "architect", "content": arch_result["content"]}
     
     architect_plan = arch_result["content"]
@@ -128,7 +130,7 @@ def run_pipeline(user_issue: str, repo_url: str) -> dict:
 
         if impl_result["status"] != "success":
             print(f"❌ Implementer failed: {impl_result['content']}")
-            if attempt == MAX_PIPELINE_RETRIES:
+            if attempt == MAX_PIPELINE_RETRIES or "TAKEOVER" in impl_result['content']:
                 sandbox.kill()
                 return {"status": "failed", "stage": "implementer", "content": impl_result["content"]}
             # Reset git state before retry

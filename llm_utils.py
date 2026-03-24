@@ -345,40 +345,83 @@ def build_failure_warning(messages: list) -> str:
 
 # ── Loop runner (shared by all agents) ───────────────────────────────────────
 
-def get_agent_explanation(messages: list, model: str, agent_name: str, failure_reason: str) -> str:
-    """
-    Asks the agent one final question before handoff.
-    Only called when failure_reason suggests the agent has coherent context.
-    """
-    # If agent was looping or confused, its explanation won't be useful
-    if failure_reason == "stuck_loop":
-        return "(Agent was stuck in a loop — explanation skipped, would not be reliable)"
+    # def get_agent_explanation(messages: list, model: str, agent_name: str, failure_reason: str) -> str:
+    #     """
+    #     Asks the agent one final question before handoff.
+    #     Only called when failure_reason suggests the agent has coherent context.
+    #     """
+    #     # If agent was looping or confused, its explanation won't be useful
+    #     if failure_reason == "stuck_loop":
+    #         return "(Agent was stuck in a loop — explanation skipped, would not be reliable)"
 
-    print(f"\n🗣️ Asking {agent_name} to explain failure...")
+    #     print(f"\n🗣️ Asking {agent_name} to explain failure...")
 
-    explanation_messages = messages.copy()
-    explanation_messages.append({
-        "role": "user",
-        "content": (
-            "Before we hand off to the user, explain the following clearly and concisely:\n\n"
-            "1. What was your goal\n"
-            "2. What approaches you tried (one line each)\n"
-            "3. The exact last error or blocker you hit\n"
-            "4. What you think the root cause is\n"
-            "5. What you would try next if you had more iterations\n\n"
-            "Be specific and technical. No fluff. Do not use any tools. Just explain."
-        )
-    })
+    #     explanation_messages = messages.copy()
+    #     explanation_messages.append({
+    #         "role": "user",
+    #         "content": (
+    #             "Before we hand off to the user, explain the following clearly and concisely:\n\n"
+    #             "1. What was your goal\n"
+    #             "2. What approaches you tried (one line each)\n"
+    #             "3. The exact last error or blocker you hit\n"
+    #             "4. What you think the root cause is\n"
+    #             "5. What you would try next if you had more iterations\n\n"
+    #             "Be specific and technical. No fluff. Do not use any tools. Just explain."
+    #         )
+    #     })
 
-    explanation = call_llm(
-        messages   = explanation_messages,
-        model      = model,
-        temperature= 0.3,
-        timeout    = 60,
-        retries    = 2,
-    )
+    #     explanation = call_llm(
+    #         messages   = explanation_messages,
+    #         model      = model,
+    #         temperature= 0.3,
+    #         timeout    = 60,
+    #         retries    = 2,
+    #     )
 
-    return explanation or "(Agent produced no explanation)"
+    #     return explanation or "(Agent produced no explanation)"
+
+
+def summarize_failure(messages: list, model: str, agent_name: str, include_observations: bool = False) -> str:
+    history_text = ""
+    for msg in messages[2:]:
+        role    = msg["role"]
+        content = msg["content"]
+
+        if role == "assistant":
+            thought = next((l for l in content.splitlines() if l.startswith("THOUGHT:")), "")
+            action  = next((l for l in content.splitlines() if l.startswith("ACTION:")), "")
+            if thought or action:
+                history_text += f"AGENT: {thought} | {action}\n"
+
+        elif role == "user" and content.startswith("TOOL:"):
+            if include_observations:
+                # Full observation capped at 300 chars
+                history_text += f"RESULT: {content[:300]}\n"
+            else:
+                # Just the first line — tool name and status
+                history_text += f"RESULT: {content.splitlines()[0]}\n"
+
+    summary_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are summarizing what happened during a failed automated coding agent run. "
+                "You will receive a log of what the agent tried. "
+                "Produce a clear, technical summary covering: "
+                "1) what the agent was trying to do, "
+                "2) what approaches it took, "
+                "3) where it got stuck or failed, "
+                "4) what the likely root cause is. "
+                "Be concise and specific. No fluff."
+            )
+        },
+        {
+            "role": "user",
+            "content": f"Agent: {agent_name}\n\nAction log:\n{history_text}"
+        }
+    ]
+
+    return call_llm(summary_messages, model=model, temperature=0.1, timeout=60, retries=2)
 
 
 
@@ -536,7 +579,7 @@ def run_agent_loop(
         )
     elif ans == "p":
         failure_reason = "stuck_loop" if _was_stuck(reply_history) else "max_iterations"
-        explanation = get_agent_explanation(messages, model, agent_name, failure_reason)
+        explanation = summarize_failure(messages, model, agent_name, True)
         print(f"\n📋 Agent explanation:\n{explanation}")
         # Return both the trigger signal and the explanation
         return f"TAKEOVER_TRIGGERED::{explanation}"
@@ -684,8 +727,8 @@ def run_agent_loop_arch(
         )
     
     elif ans == "p":
-        failure_reason = "stuck_loop" if _was_stuck(reply_history) else "max_iterations"
-        explanation = get_agent_explanation(messages, model, agent_name, failure_reason)
+        # failure_reason = "stuck_loop" if _was_stuck(reply_history) else "max_iterations"
+        explanation = summarize_failure(messages, model, 'architect', False)
         print(f"\n📋 Agent explanation:\n{explanation}")
         # Return both the trigger signal and the explanation
         return f"TAKEOVER_TRIGGERED::{explanation}"
