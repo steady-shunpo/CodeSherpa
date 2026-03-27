@@ -32,12 +32,38 @@ RIGHT: read_file("tests/test_foo.py", 1, 50)
 TOOLS (plain text only — no JSON):
 1. read_file("path", start, end)        — Read source files.
 2. read_files_bulk(["path1", "path2"])  — Read multiple files in one turn.
-3. edit_file("path", start, end)        — Edit lines in a file.
 |||
 <new code>
 |||
-4. run_bash_command("cmd")              — Run shell commands.
-5. search_file("path", "term")          — Search for a term in a file.
+3. run_bash_command("cmd")              — Run shell commands.
+4. search_file("path", "term")          — Search for a term in a file.
+5. reset_file("path")                   - Resets given file to its original state    
+5. edit_file("path", start, end)        — Edit lines in a file.
+edit_file REPLACES the specified lines with your new code.
+It does NOT insert — it DELETES lines start through end and puts your code there.
+
+To INSERT a new method after line 445 WITHOUT deleting anything:
+- Your replacement must include the original line 445 PLUS your new code
+
+WRONG — this deletes line 445:
+ACTION: edit_file("file.py", 445, 445)
+|||
+def my_new_method(self):
+    pass
+|||
+
+CORRECT — this keeps line 445 and adds after it:
+ACTION: edit_file("file.py", 445, 445)
+|||
+<original content of line 445>
+
+def my_new_method(self):
+    pass
+|||
+
+MANDATORY: After every edit_file call you MUST immediately read back 
+the edited section to verify the file looks correct before continuing.
+If it looks wrong, use git checkout to reset and try again
 
 RULES:
 - ONE tool call per turn. Output __END__ and stop.
@@ -116,8 +142,8 @@ def run_implementer(architect_plan: str, test_result: dict, env_summary: str,
             return None
 
         elif decision["status"] == "TAKEOVER":
-            explanation = summarize_failure(messages, model, "implementer", True)
-            return f"TAKEOVER_TRIGGERED::{explanation}"
+            # explanation = summarize_failure(messages, model, "implementer", True)
+            return f"TAKEOVER"
 
         return git_diff
 
@@ -133,9 +159,18 @@ def run_implementer(architect_plan: str, test_result: dict, env_summary: str,
         env               = env,
     )
 
-    if "TAKEOVER_TRIGGERED" in result:
-        return {"status": "failed", "content": result}
-    if result in ("TIMEOUT", ""):
-        return {"status": "failed", "content": "Implementer timed out without completing the fix."}
-
+    if "TAKEOVER" in result:
+        return {
+            "status":   "failed",
+            "content":  "TAKEOVER",
+            "reason":   "bad implementation",      # ← add this
+            "messages": messages,              # ← add this
+        }
+    if "TIMEOUT" in result:
+        return {
+            "status":   "failed",
+            "content":  "TIMEOUT",
+            "reason":   "max_iterations",      # ← add this
+            "messages": messages,              # ← add this
+        }
     return {"status": "success", "content": result, "git_diff": result}

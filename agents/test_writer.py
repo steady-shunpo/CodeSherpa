@@ -101,7 +101,7 @@ DO NOT use cd. DO NOT retry the same command twice.
 
 
 def run_test_writer(architect_plan: str, user_issue: str, env_summary: str, env: dict,
-                    repo_context: str, sandbox, test_hint: str, max_iterations: int = 25) -> dict:
+                    repo_context: str, sandbox, test_hint: str, max_iterations: int = 30) -> dict:
     model = "deepseek-ai/deepseek-v3.1"
     print("\n" + "=" * 50)
     print("🧪 STARTING TEST WRITER")
@@ -112,7 +112,7 @@ def run_test_writer(architect_plan: str, user_issue: str, env_summary: str, env:
     system_prompt = TEST_WRITER_SYSTEM_PROMPT + "\n\n" + IMPORT_ERROR_STRATEGY
 
     infra = detect_custom_test_infrastructure(sandbox, env)
-    print(infra)
+    print("INFRA", infra)
     test_writer_extra = ""
     if infra["is_complex"]:
         test_writer_extra = (
@@ -165,8 +165,8 @@ def run_test_writer(architect_plan: str, user_issue: str, env_summary: str, env:
             return None
 
         elif decision["status"] == "TAKEOVER":
-            explanation = summarize_failure(messages, model, "test_writer", True)
-            return f"TAKEOVER_TRIGGERED::{explanation}"
+            # explanation = summarize_failure(messages, model, "test_writer", True)
+            return "TAKEOVER"
 
         result_holder["result"] = raw_reply
         return raw_reply
@@ -188,10 +188,20 @@ def run_test_writer(architect_plan: str, user_issue: str, env_summary: str, env:
     # Extract test file and command from the FINAL_RESULT block
     test_file    = _extract_field(result, "TEST_FILE:")
     test_command = _extract_field(result, "TEST_COMMAND:")
-    if "TAKEOVER_TRIGGERED" in result:
-        return {"status": "failed", "content": result}
-    if result in ("TIMEOUT", ""):
-        return {"status": "failed", "content": "Test writer timed out without a failing test."}
+    if "TAKEOVER" in result:
+        return {
+            "status":   "failed",
+            "content":  "TAKEOVER",
+            "reason":   "bad test",      # ← add this
+            "messages": messages,              # ← add this
+        }
+    if "TIMEOUT" in result:
+        return {
+            "status":   "failed",
+            "content":  "TIMEOUT",
+            "reason":   "max_iterations",      # ← add this
+            "messages": messages,              # ← add this
+        }
 
     return {
         "status":       "success",

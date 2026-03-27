@@ -60,6 +60,7 @@ TOOL_PATTERNS = {
     "edit":      re.compile(r'ACTION:\s*edit_file\(\s*"([^"]+)"\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\)\s*(?:\|\|\||```(?:\w+)?)\n(.*?)(?:\|\|\||```)', re.DOTALL),
     "write":     re.compile(r'ACTION:\s*write_file\(\s*"([^"]+)"\s*\)\s*(?:\|\|\||```(?:\w+)?)\n(.*?)(?:\|\|\||```)', re.DOTALL),
     "read_bulk": re.compile(r'ACTION:\s*read_files_bulk\(\s*\[(.*?)\]\s*\)', re.DOTALL),
+    "reset_file": re.compile(r'ACTION:\s*reset_file\(\s*"([^"]+)"\s*\)'),
 }
 
 def parse_and_execute(agent_reply: str, sandbox) -> tuple[str, str]:
@@ -106,6 +107,10 @@ def parse_and_execute(agent_reply: str, sandbox) -> tuple[str, str]:
         print(f"🔧 search_file: {fp} for '{term}'")
         result = run_remote_command(sandbox, f"cd workspace/repo && grep -n '{term}' {fp}")
         return "search_file", result
+    if m := TOOL_PATTERNS["reset_file"].search(agent_reply):
+        fp = m.group(1)
+        result = run_remote_command(sandbox, f"cd workspace/repo && git checkout {fp}")
+        return "reset_file", f"Reset {fp} to original state. Start fresh."
 
     return "none", ""
 

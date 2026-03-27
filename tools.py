@@ -3,6 +3,8 @@ import pickle
 import json
 import networkx as nx
 import os
+import re
+import requests
 from e2b_code_interpreter import Sandbox
 from dotenv import load_dotenv
 import time
@@ -257,7 +259,7 @@ def setup_developer_environment(repo_url: str):
     
     print(f"📦 Cloning repository {repo_url} into Sandbox...")
     depth = 5
-    gitHash = "15f56f3b0006d2ed2c29bde3c43e91618012c849"
+    gitHash = "e8c22f6eac7314be8d92590bfff92ced79ee03e2"
     # Clone the repo. We use run_remote_command so we can see if it worked!
     clone_result = run_remote_command(sandbox, f"git clone --depth {depth} {repo_url} workspace/repo")
     clone_result = run_remote_command(sandbox, f"cd workspace/repo && git fetch --depth {depth} origin {gitHash}")
@@ -333,3 +335,36 @@ def extract_final_plan(text):
 # print(res)
 # readme = run_remote_command(sandbox, "cd workspace/repo && cat README.md 2>/dev/null | head -50")
 # print(readme)
+
+
+
+
+def get_issue(url):
+    # 1. Regex Match
+    pattern = r"github\.com/([^/]+)/([^/]+)/issues/(\d+)"
+    match = re.search(pattern, url)
+    
+    if not match:
+        raise ValueError("Invalid GitHub issue URL")
+
+    owner, repo, number = match.groups()
+
+    # 2. API Request
+    res = requests.get(f"https://api.github.com/repos/{owner}/{repo}/issues/{number}")
+    
+    # Check for 404s or connection errors
+    if res.status_code != 200:
+        raise Exception(f"Issue not found: {res.status_code}")
+
+    issue = res.json()
+
+    # 3. Return Dictionary (Mapping the JS object structure)
+    return {
+        "owner": owner,
+        "repo": repo,
+        "number": number,
+        "title": issue.get("title"),
+        "body": issue.get("body"),
+        "labels": [l["name"] for l in issue.get("labels", [])],
+        "state": issue.get("state"),
+    }

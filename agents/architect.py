@@ -5,11 +5,11 @@ import re
 import subprocess
 import os
 
-ARCHITECT_SYSTEM_PROMPT = """
-Role: Senior AI Software Architect
+PLANNER_SYSTEM_PROMPT = """
+Role: Senior AI Software Engineer
 
-Objective: Analyze a GitHub issue and produce a surgical implementation plan.
-You have access to a repository graph showing how files are connected.
+Objective: Analyze a GitHub issue, find the root cause in the codebase,
+and produce a precise implementation plan.
 
 TOOLS (plain text only — no JSON):
 1. search_repo("term")           — Ego-graph of a function, class, or variable.
@@ -17,46 +17,44 @@ TOOLS (plain text only — no JSON):
 2. read_file("path", start, end) — Read source code. end can be -1 for end of file.
 3. search_file("path", "term")   — Search for a term in a specific file.
                                    Returns matching lines with line numbers.
-                                   e.g. search_file("tests/expressions/tests.py", "order_by")
 
 RULES:
 - ONE tool call per turn. Output __END__ and stop immediately.
-- Do NOT write test cases. A separate agent handles testing.
+- Do NOT write test cases. A separate agent handles that.
 - Do NOT write commit messages.
+- Do NOT write TEST_HINT. A separate agent handles that.
 - Never hallucinate observations. Wait for the real result.
 - No JSON tool calls ever.
 - Each response = exactly one THOUGHT + one ACTION + __END__. Nothing more.
+
+READING STRATEGY:
+- Read wide ranges (50-100 lines) rather than multiple narrow reads
+- Do not read the same section twice
+- search_repo first to find the file, then read_file to see the code
+- Once you have enough context, output FINAL_PLAN immediately
 
 FORMAT 1 — Gathering context:
 THOUGHT: <reasoning>
 ACTION: search_repo("Name") or read_file("path/file.py", 10, 50) or search_file("path", "term")
 __END__
 
-FORMAT 2 — Final output:
-THOUGHT: <how you found the bug and why this fix works>
+FORMAT 2 — Final output (when you are confident about the fix):
+THOUGHT: <how you found the bug and exactly why this fix works>
 FINAL_PLAN:
-<step-by-step fix with exact file paths, line numbers, and code changes>
 
-TEST_HINT:
-- test_style: <unittest|pytest — must be confirmed by reading an existing test file>
-- test_file_location: <exact path where test should be added, e.g. tests/expressions/tests.py>
-- existing_test_example: <exact path AND line range, e.g. tests/expressions/tests.py lines 379-400>
-- existing_test_class: <exact class name to add the test to, e.g. BasicExpressionsTests>
-- relevant_imports: <exact import lines the test will need, copied from the actual file>
-- models_available: <exact model names and their fields, e.g. Employee(firstname, lastname, salary)>
-- test_setup: <exact setup needed, e.g. 'use cls.example_inc from setUpTestData' or 'none'>
-- trigger: <one sentence: exact call that triggers the bug>
-- verify_with: <exact assertion — what is wrong that should be right>
-- example_test: <a complete working test method using REAL model names, REAL fields, REAL imports>
+<plain english explanation of the bug and why the fix works>
 
-MANDATORY BEFORE WRITING TEST_HINT:
-1. You MUST read the relevant test file to find exact class name and line numbers.
-2. You MUST read the models file to get exact model names and field names.
-3. existing_test_example MUST include line numbers — 'tests/foo.py' alone is rejected.
-4. example_test MUST use real model names — never use MyModel, SomeModel, or any placeholder.
-5. relevant_imports MUST be copied from the actual file, not guessed.
+FILE: <exact file path>
+LOCATION: <function/method name where change goes>
+LINES: <approximate line numbers>
+ANCHOR: <exact line of code immediately before the insertion/change point>
+CHANGE:
+<before code>
+---
+<after code>
+
+Repeat FILE/LOCATION/LINES/ANCHOR/CHANGE block for each change needed.
 """
-
 # Architect uses local files, not a sandbox
 ARCH_TOOL_PATTERNS = {
     "search":      re.compile(r'ACTION:\s*search_repo\(\s*"([^"]+)"\s*\)'),
@@ -111,60 +109,68 @@ def _arch_parse_and_execute(agent_reply: str, _sandbox) -> tuple[str, str]:
     return "none", ""
 
 
-def run_architect(user_issue: str, max_iterations: int = 20) -> dict:
+def run_planner(user_issue: str, max_iterations: int = 25) -> dict:
     model = "nvidia/nemotron-3-super-120b-a12b"
     print("\n" + "=" * 50)
-    print("🧠 STARTING ARCHITECT")
+    print("🧠 STARTING PLANNER")
     print("=" * 50)
 
-    final_plan_holder = {}
-
     messages = [
-        {"role": "system", "content": ARCHITECT_SYSTEM_PROMPT},
+        {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
         {"role": "user",   "content": f"Here is the issue to analyze:\n\n{user_issue}"},
     ]
 
     def on_done(raw_reply: str, msgs: list):
-        print("\n✅ Architect has a plan!")
-        decision = checkpoint_gate("Architect", raw_reply)
+        print("\n✅ Planner has a plan!")
+        decision = checkpoint_gate("Planner", raw_reply)
 
         if decision["status"] == "PROCEED":
-            final_plan_holder["plan"] = raw_reply
-            return raw_reply  # signals loop to stop
+            return raw_reply
 
         elif decision["status"] == "RETRY":
             msgs.append({
                 "role": "user",
                 "content": (
                     f"Your plan was rejected.\nFeedback: {decision['feedback']}\n\n"
-                    "Search or read more files if needed, then output a revised FINAL_PLAN."
+                    "Read more files if needed, then output a revised FINAL_PLAN."
                 )
             })
-            return None  # signals loop to keep going
+            return None
 
         elif decision["status"] == "TAKEOVER":
-            explanation = summarize_failure(messages, model, "architect", False)
-            final_plan_holder["takeover"] = True
-            return f"TAKEOVER_TRIGGERED::{explanation}"
+            return f"TAKEOVER::{raw_reply}"
 
-
-        final_plan_holder["plan"] = raw_reply
         return raw_reply
 
     result = run_agent_loop_arch(
-        messages        = messages,
-        model = model,
+        messages          = messages,
+        model             = model,
         parse_and_execute = _arch_parse_and_execute,
-        sandbox         = None,
-        max_iters       = max_iterations,
-        done_token      = "FINAL_PLAN:",
-        agent_name      = "🧠 Architect",
-        on_done         = on_done,
+        sandbox           = None,
+        max_iters         = max_iterations,
+        done_token        = "FINAL_PLAN:",
+        agent_name        = "🧠 Planner",
+        on_done           = on_done,
     )
 
-    if "TAKEOVER_TRIGGERED" in result:
-        return {"status": "failed", "content": "Takeover triggered.", "result": result}
-    if result in ("TIMEOUT", ""):
-        return {"status": "failed", "content": f"Architect timed out. Last message:\n{messages[-1]['content']}"}
+    if "TAKEOVER" in result:
+        return {
+            "status":   "failed",
+            "content":  result,
+            "reason":   "takeover",
+            "messages": messages,
+        }
+    if "TIMEOUT" in result:
+        return {
+            "status":   "failed",
+            "content":  "TIMEOUT",
+            "reason":   "max_iterations",
+            "messages": messages,
+        }
 
-    return {"status": "success", "content": result}
+    return {
+        "status":   "success",
+        "content":  result,
+        "reason":   "",
+        "messages": messages,
+    }

@@ -431,14 +431,14 @@ def extract_action_line(reply: str) -> str:
             return line.strip()
     return reply.strip()[:120]
 
-def _was_stuck(reply_history: list) -> bool:
-    """
-    Returns True if the last few replies were identical,
-    indicating the agent was looping rather than making progress.
-    """
-    if len(reply_history) < 3:
-        return False
-    return len(set(reply_history[-3:])) == 1
+# def _was_stuck(reply_history: list) -> bool:
+#     """
+#     Returns True if the last few replies were identical,
+#     indicating the agent was looping rather than making progress.
+#     """
+#     if len(reply_history) < 3:
+#         return False
+#     return len(set(reply_history[-3:])) == 1
 
 
 def run_agent_loop(
@@ -578,11 +578,11 @@ def run_agent_loop(
             10, done_token, agent_name, on_done, model, env
         )
     elif ans == "p":
-        failure_reason = "stuck_loop" if _was_stuck(reply_history) else "max_iterations"
-        explanation = summarize_failure(messages, model, agent_name, True)
-        print(f"\n📋 Agent explanation:\n{explanation}")
+        # failure_reason = "stuck_loop" if _was_stuck(reply_history) else "max_iterations"
+        # explanation = summarize_failure(messages, model, agent_name, True)
+        # print(f"\n📋 Agent explanation:\n{explanation}")
         # Return both the trigger signal and the explanation
-        return f"TAKEOVER_TRIGGERED::{explanation}"
+        return f"TAKEOVER"
     
     return "TIMEOUT"
 
@@ -728,9 +728,9 @@ def run_agent_loop_arch(
     
     elif ans == "p":
         # failure_reason = "stuck_loop" if _was_stuck(reply_history) else "max_iterations"
-        explanation = summarize_failure(messages, model, 'architect', False)
-        print(f"\n📋 Agent explanation:\n{explanation}")
+        # explanation = summarize_failure(messages, model, 'architect', False)
+        # print(f"\n📋 Agent explanation:\n{explanation}")
         # Return both the trigger signal and the explanation
-        return f"TAKEOVER_TRIGGERED::{explanation}"
+        return f"TAKEOVER"
     
     return "TIMEOUT"

@@ -10,7 +10,7 @@ client = OpenAI(
     base_url="https://integrate.api.nvidia.com/v1",
 )
 
-MODEL = "nvidia/nemotron-3-super-120b-a12b"
+MODEL = "deepseek-ai/deepseek-v3.1"
 
 # ── Shared prompt snippets ────────────────────────────────────────────────────
 
