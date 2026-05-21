@@ -1,6 +1,6 @@
 from tools import checkpoint_gate, setup_developer_environment
 from llm_utils import run_agent_loop, summarize_failure
-from sandbox_utils import parse_and_execute, detect_custom_test_infrastructure
+from sandbox_utils import parse_and_execute
 # TEST_WRITER_SYSTEM_PROMPT = """
 # Role: Software Test Engineer
 
@@ -434,7 +434,7 @@ def run_test_writer(architect_plan: str, user_issue: str, env_summary: str, env:
 
     # system_prompt = TEST_WRITER_SYSTEM_PROMPT + "\n\n" + IMPORT_ERROR_STRATEGY
 
-    infra = detect_custom_test_infrastructure(sandbox, env)
+    # infra = detect_custom_test_infrastructure(sandbox, env)
     hint_section = (
         f"TEST_HINT (read this first — it tells you exactly what to write):\n"
         f"{test_hint}\n\n"

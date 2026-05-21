@@ -5,12 +5,12 @@ import asyncio
 import threading
 from repograph.construct_graph import build_and_save_repograph
 import time
-from utils.tools import get_issue, simple_clone
+from tools import get_issue, simple_clone
 from fastapi.middleware.cors import CORSMiddleware
 import subprocess
 import uuid
-from discussion import DiscussionSession, detect_pipeline_trigger
-from utils.llmutils import call_llm
+# from discussion import DiscussionSession, detect_pipeline_trigger
+from llm_utils import call_llm
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from db.database import Base, engine
@@ -104,52 +104,52 @@ async def prepare_workspace(issue_url: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-sessions: dict[str, DiscussionSession] = {}
+# sessions: dict[str, DiscussionSession] = {}
 
-@app.post("/discussion/start")
-async def start_discussion(req: StartDiscussionRequest):
-    session_id = str(uuid.uuid4())
-    session = DiscussionSession(req.issue_text)
-    sessions[session_id] = session
+# @app.post("/discussion/start")
+# async def start_discussion(req: StartDiscussionRequest):
+#     session_id = str(uuid.uuid4())
+#     session = DiscussionSession(req.issue_text)
+#     sessions[session_id] = session
 
-    def stream():
-        full = ""
-        for chunk in call_llm(session.messages, model="deepseek-ai/deepseek-v3.1", temperature=0.3):
-            full += chunk
-            yield chunk
-        session.messages.append({"role": "assistant", "content": full})
+#     def stream():
+#         full = ""
+#         for chunk in call_llm(session.messages, model="deepseek-ai/deepseek-v3.1", temperature=0.3):
+#             full += chunk
+#             yield chunk
+#         session.messages.append({"role": "assistant", "content": full})
 
-    return StreamingResponse(
-        stream(),
-        media_type="text/plain",
-        headers={"X-Session-ID": session_id}
-    )
+#     return StreamingResponse(
+#         stream(),
+#         media_type="text/plain",
+#         headers={"X-Session-ID": session_id}
+#     )
 
 
-@app.post("/discussion/message")
-async def send_message(req: MessageRequest):
-    print(req.user_input)
-    session = sessions.get(req.session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+# @app.post("/discussion/message")
+# async def send_message(req: MessageRequest):
+#     print(req.user_input)
+#     session = sessions.get(req.session_id)
+#     if not session:
+#         raise HTTPException(status_code=404, detail="Session not found")
 
-    if detect_pipeline_trigger(req.user_input):
-        session.pipeline_triggered = True
-        return {
-            "pipeline_triggered": True,
-            "extra_context": session._collect_extra_context(),
-        }
+#     if detect_pipeline_trigger(req.user_input):
+#         session.pipeline_triggered = True
+#         return {
+#             "pipeline_triggered": True,
+#             "extra_context": session._collect_extra_context(),
+#         }
 
-    if len(req.user_input) > 30 and "?" not in req.user_input:
-        session.extra_context.append(req.user_input)
+#     if len(req.user_input) > 30 and "?" not in req.user_input:
+#         session.extra_context.append(req.user_input)
 
-    session.messages.append({"role": "user", "content": req.user_input})
+#     session.messages.append({"role": "user", "content": req.user_input})
 
-    def stream():
-        full = ""
-        for chunk in call_llm(session.messages, model="deepseek-ai/deepseek-v3.1", temperature=0.3):
-            full += chunk
-            yield chunk
-        session.messages.append({"role": "assistant", "content": full})
+#     def stream():
+#         full = ""
+#         for chunk in call_llm(session.messages, model="deepseek-ai/deepseek-v3.1", temperature=0.3):
+#             full += chunk
+#             yield chunk
+#         session.messages.append({"role": "assistant", "content": full})
 
-    return StreamingResponse(stream(), media_type="text/plain")
+#     return StreamingResponse(stream(), media_type="text/plain")

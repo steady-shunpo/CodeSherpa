@@ -1,17 +1,17 @@
 import time
-from sandbox_utils import probe_environment, build_repo_context
+
 from agents.architect    import run_planner, run_hint_writer
 from agents.test_writer  import run_test_writer
 from agents.implementer  import run_implementer
 from agents.verifier     import run_verifier
 from agents.intervention import intervention_session
 from llm_utils import extract_test_hint
-from discussion import run_discussion_loop
+# from discussion import run_discussion_loop
 from tools import get_issue, format_issue_for_pipeline, simple_clone
 from repograph.construct_graph import build_and_save_repograph
 from failure_doc import (
     create_failure_doc, finalize_failure_doc,
-    finalize_success_doc, get_latest_doc
+    # finalize_success_doc, get_latest_doc
 )
 
 
@@ -39,14 +39,14 @@ def stage_planner(doc: dict, **_) -> tuple[dict, dict | None]:
 
     if result["status"] != "success":
         print(f"❌ Planner failed: {result['content']}")
-            doc            = doc,
+        doc["architect_plan"] = result.get("content", "")
+        return finalize_failure_doc(
+            doc= doc,
             stage          = "planner",
             failure_reason = result.get("reason", "max_iterations"),
             messages       = result.get("messages", []),
             model          = "mistralai/mistral-medium-3.5-128b",
-        ), Nonedoc["architect_plan"] = result.get("content", "")
-        return finalize_failure_doc(
-        
+        ), None
 
     doc["architect_plan"] = result["content"]
     print(f"\n📋 Planner done ({len(result['content'])} chars)")
@@ -102,7 +102,8 @@ def stage_setup(doc: dict, architect_plan: str | None = None, **_) -> tuple[dict
     print(env_summary)
 
     print("\n📁 Building repo context...")
-    repo_context = build_repo_context(sandbox, architect_plan)
+    # repo_context = build_repo_context(sandbox, architect_plan)
+    repo_context = ""
 
     return doc, {"sandbox": sandbox, "env": env, "env_summary": env_summary, "repo_context": repo_context}
 

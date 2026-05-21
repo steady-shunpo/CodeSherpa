@@ -1,5 +1,6 @@
 from llm_utils import call_llm
 import re
+from sandbox_utils import parse_and_execute
 
 
 HINT_SUPERVISOR_SYSTEM_PROMPT = """
@@ -219,7 +220,7 @@ def run_hint_supervisor(hint_text: str, messages_ref: list) -> tuple[bool, str]:
                 })
                 continue
 
-            _, observation = _arch_parse_and_execute(raw_reply, sandbox=None)
+            _, observation = parse_and_execute(raw_reply, sandbox=None)
             print(f"\n[{tool_name}]: {observation[:300]}...")
             messages.append({
                 "role": "user",
