@@ -8,8 +8,10 @@ import requests
 from e2b_code_interpreter import Sandbox
 from dotenv import load_dotenv
 import time
+import subprocess 
+import shutil
 
-load_dotenv()
+load_dotenv("../.env")
 #CHANGE read_local_file. FILE PATH IS HARDCODED RN
 
 def search_repo_advanced(search_term, graph_path='graph.pkl', tags_path='tags.jsonl'):
@@ -251,34 +253,76 @@ def write_remote_file(sandbox: Sandbox, file_path: str, content: str):
         return f"ERROR: Could not write file. {str(e)}"
 
 
-
+UNSUPPORTED_REPOS = ["scikit-learn", "matplotlib", "astropy"]
 
 def setup_developer_environment(repo_url: str):
-    print("☁️  Spinning up E2B Sandbox...")
-    sandbox = Sandbox.create(timeout=3000) # This creates the remote Linux environment
-    
-    print(f"📦 Cloning repository {repo_url} into Sandbox...")
-    depth = 5
-    gitHash = "e8c22f6eac7314be8d92590bfff92ced79ee03e2"
-    # Clone the repo. We use run_remote_command so we can see if it worked!
-    clone_result = run_remote_command(sandbox, f"git clone --depth {depth} {repo_url} workspace/repo")
-    clone_result = run_remote_command(sandbox, f"cd workspace/repo && git fetch --depth {depth} origin {gitHash}")
-    clone_result = run_remote_command(sandbox, f"cd workspace/repo && git checkout {gitHash}")
-    while("fatal" in clone_result):
-        time.sleep(30)
-        clone_result = run_remote_command(sandbox, f"cd workspace/repo && git fetch --depth {depth} origin {gitHash}")
-        clone_result = run_remote_command(sandbox, f"cd workspace/repo && git checkout {gitHash}")
-        depth += 5
-        # clone_result = run_remote_command(sandbox, f"cd workspace/repo && git checkout {gitHash}")
-    print(clone_result)
+    # Check if repo is supported
+    if any(repo in repo_url.lower() for repo in UNSUPPORTED_REPOS):
+        raise ValueError(f"Repo {repo_url} requires system-level dependencies and is not supported.")
 
-    
-    # Optional: If you are testing the 'requests' repo, you might need to install it
-    # print("⚙️  Installing dependencies...")
-    # install_result = run_remote_command(sandbox, "cd workspace/repo && pip install -e .[tests]")
-    # print(install_result)
-    
-    return sandbox
+    print("☁️  Spinning up E2B Sandbox...")
+    sandbox = Sandbox.create(timeout=3000)
+    git_hash = ""
+    # ── 1. Clone & checkout ──────────────────────────────────────────────────
+    print(f"📦 Cloning {repo_url}...")
+    run_remote_command(sandbox, f"git clone --depth 1 {repo_url} workspace/repo", timeout=120)
+    # run_remote_command(sandbox, f"cd workspace/repo && git fetch --depth 50 origin {git_hash}", timeout=60)
+    # run_remote_command(sandbox, f"cd workspace/repo && git checkout {git_hash}", timeout=30)
+
+    # Verify checkout landed
+    verify = run_remote_command(sandbox, "cd workspace/repo && git rev-parse HEAD")
+    print(f"✅ HEAD: {verify}")
+
+    # ── 2. Resolve home dir ───────────────────────────────────────────────────
+    home_result = run_remote_command(sandbox, "echo $HOME")
+    home = "/root"  # fallback
+    for line in home_result.splitlines():
+        line = line.strip()
+        if line.startswith("/"):
+            home = line
+            break
+
+    # ── 3. Install dependencies ───────────────────────────────────────────────
+    print("📦 Installing dependencies...")
+    install_result = run_remote_command(sandbox, """
+cd workspace/repo && \
+pip install -e ".[test,dev,testing,tests]" 2>&1 | tail -5 || pip install -e "." 2>&1 | tail -5; \
+for f in requirements-test.txt requirements-dev.txt requirements/test.txt requirements/dev.txt; do \
+    [ -f "$f" ] && pip install -r "$f"; \
+done
+""", timeout=300)
+    print(f"📋 Install output: {install_result[-500:]}")
+
+    # ── 4. Resolve PYTHONPATH ─────────────────────────────────────────────────
+    src_check = run_remote_command(sandbox, f"[ -d {home}/workspace/repo/src ] && echo 'src' || echo 'root'")
+    pythonpath = f"{home}/workspace/repo/src" if "src" in src_check else f"{home}/workspace/repo"
+    print("PYTHONPATH", pythonpath)
+    # ── 5. Repo-specific overrides ────────────────────────────────────────────
+    pytest_flags = "--import-mode=importlib"  # default for all
+
+    if "django" in repo_url.lower():
+        run_remote_command(sandbox, "pip install pytest-django", timeout=60)
+        grep_result = run_remote_command(sandbox,
+            "cd workspace/repo && grep -r 'DJANGO_SETTINGS_MODULE' --include='*.py' -l | head -1")
+        settings_path = ""
+        for line in grep_result.splitlines():
+            line = line.strip()
+            if line.endswith(".py"):
+                settings_path = line
+                break
+        if settings_path:
+            settings_module = settings_path.lstrip("./").replace("/", ".").replace(".py", "")
+            pytest_flags = f"--import-mode=importlib --ds={settings_module}"
+            print(f"🔧 Django settings: {settings_module}")
+        else:
+            print("⚠️  Could not find DJANGO_SETTINGS_MODULE — Django tests may fail")
+
+    elif "seaborn" in repo_url.lower():
+        run_remote_command(sandbox, "pip install matplotlib scipy", timeout=60)
+
+    print(f"✅ Environment ready — PYTHONPATH={pythonpath}, pytest_flags={pytest_flags}")
+    return sandbox, pythonpath, pytest_flags
+
 
 # Usage:
 # my_sandbox = setup_developer_environment("https://github.com/psf/requests.git")
@@ -348,15 +392,41 @@ def get_issue(url):
         raise ValueError("Invalid GitHub issue URL")
 
     owner, repo, number = match.groups()
+    headers = {"Authorization": f"token {os.environ.get('GITHUB_TOKEN', '')}"}
 
     # 2. API Request
-    res = requests.get(f"https://api.github.com/repos/{owner}/{repo}/issues/{number}")
-    
+    res = requests.get(f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", )
+    print("GITHUB REQUEST", res)
     # Check for 404s or connection errors
     if res.status_code != 200:
         raise Exception(f"Issue not found: {res.status_code}")
 
     issue = res.json()
+
+    comments_resp = requests.get(
+        f"https://api.github.com/repos/{owner}/{repo}/issues/{number}/comments",
+        # headers=headers
+    )
+    if not comments_resp.ok:
+        print(f"Comments fetch failed: {comments_resp.status_code} - {comments_resp.json()}")
+        comments = []
+    else:
+        comments = comments_resp.json()
+        if not isinstance(comments, list):
+            print(f"Unexpected comments response: {comments}")
+            comments = []
+    
+    # Format comments — include author and body, skip bot comments
+    formatted_comments = []
+    for c in comments:
+        author = c["user"]["login"]
+        # Skip common bots
+        if any(bot in author.lower() for bot in ["bot", "stale", "codecov"]):
+            continue
+        body = c["body"].strip()
+        if len(body) < 20:  # skip trivial comments like "same here"
+            continue
+        formatted_comments.append(f"@{author}:\n{body}")
 
     # 3. Return Dictionary (Mapping the JS object structure)
     return {
@@ -367,4 +437,43 @@ def get_issue(url):
         "body": issue.get("body"),
         "labels": [l["name"] for l in issue.get("labels", [])],
         "state": issue.get("state"),
+        "comments": formatted_comments
     }
+
+
+def format_issue_for_pipeline(issue_data: dict) -> str:
+    """
+    Combines issue body and comments into a single string for the planner.
+    Keeps comments but caps length to avoid blowing up context.
+    """
+    parts = [
+        f"ISSUE TITLE: {issue_data['title']}",
+        f"\nISSUE DESCRIPTION:\n{issue_data['body']}",
+    ]
+    
+    if issue_data.get("comments"):
+        parts.append("\nDISCUSSION COMMENTS:")
+        total_comment_chars = 0
+        for comment in issue_data["comments"]:
+            if total_comment_chars > 3000:
+                parts.append("... (remaining comments truncated)")
+                break
+            parts.append(comment)
+            total_comment_chars += len(comment)
+    
+    return "\n\n".join(parts)
+
+def simple_clone(api_url: str, target_dir: str = "testRepos"):
+    # 1. Nuke the folder if it exists (ignore_errors bypasses the Windows read-only lock)
+    if os.path.exists(target_dir):
+        subprocess.run(["rmdir", "/s", "/q", target_dir], shell=True)
+    
+    # 2. Fix the URL so Git can actually read it
+    # Changes "https://api.github.com/repos/owner/repo" -> "https://github.com/owner/repo.git"
+    git_url = api_url.replace("api.github.com/repos", "github.com") + ".git"
+    
+    # 3. Clone it
+    subprocess.run(
+    ["git", "clone", "--depth", "1", git_url, target_dir],
+    check=True
+)

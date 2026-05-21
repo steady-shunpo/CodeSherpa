@@ -1,6 +1,5 @@
 import { useState } from 'react';
 import { useApp } from '../store/appStore';
-import { fetchIssue } from '../utils/api';
 import { ArrowRight, Zap } from 'lucide-react';
 
 const EXAMPLES = [
@@ -22,22 +21,35 @@ export default function IdleScreen() {
     }
     setError('');
     dispatch({ type: 'START_LOADING', url: trimmed });
+
     try {
-      const issue = await fetchIssue(trimmed);
-      dispatch({ type: 'LOADING_DONE', issue });
-    } catch {
-      dispatch({ type: 'LOADING_DONE', issue: {
-        owner: 'demo', repo: 'project', number: '1',
-        title: 'Demo Issue #1', body: 'a sample issue for demonstration',
-        labels: ['bug'], state: 'open',
-      }});
+      const res = await fetch(
+        `http://localhost:8000/build-workspace?issue_url=${encodeURIComponent(trimmed)}`
+      );
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || 'Server error');
+      }
+      const data = await res.json();
+      dispatch({
+        type: 'LOADING_DONE',
+        issue: {
+          owner: data.owner,
+          repo: data.repo,
+          number: trimmed.match(/issues\/(\d+)/)[1],
+          title: data.title,
+          body: data.body,
+          labels: [],
+          state: 'open',
+        },
+      });
+    } catch (e) {
+      dispatch({ type: 'LOADING_ERROR', message: e.message });
     }
   }
 
   return (
     <div className="flex-1 flex flex-col items-center justify-center gap-8 p-10 animate-in fade-in duration-300">
-
-      {/* Hero */}
       <div className="flex flex-col items-center gap-3 text-center">
         <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full border border-primary/40 bg-primary/10 text-primary text-xs font-medium">
           <Zap size={11} /> AI-powered debugging
@@ -50,7 +62,6 @@ export default function IdleScreen() {
         </p>
       </div>
 
-      {/* Input */}
       <div className="w-full max-w-lg flex flex-col gap-2">
         <div className="flex gap-2 p-1.5 pl-4 bg-card border border-border rounded-xl focus-within:border-ring transition-colors shadow-sm">
           <input
@@ -70,7 +81,6 @@ export default function IdleScreen() {
         {error && <p className="text-destructive text-xs pl-1">{error}</p>}
       </div>
 
-      {/* Examples */}
       <div className="flex flex-col items-center gap-2">
         <p className="text-[10px] uppercase tracking-widest text-muted-foreground/50">Try an example</p>
         <div className="flex gap-2 flex-wrap justify-center">

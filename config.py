@@ -1,8 +1,34 @@
 import os
 from openai import OpenAI
 from dotenv import load_dotenv
+from pydantic_settings import BaseSettings
+
 
 load_dotenv()
+
+
+
+class Settings(BaseSettings):
+    # Postgres — full async DSN, e.g.:
+    # postgresql+asyncpg://user:password@localhost:5432/issue_resolver
+    database_url: str = "postgresql+asyncpg://codesherpa:codesherpa@localhost:5432/codesherpa"
+
+    # Redis — for Phase 2/3, not used yet
+    redis_url: str = "redis://localhost:6379"
+
+    # App
+    debug: bool = False
+    max_retries: int = 3  # verifier retry limit before BLOCKED_ON_HUMAN
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+
+
+# Single instance imported everywhere
+settings = Settings()
+
+
 
 # ── API Client ────────────────────────────────────────────────────────────────
 client = OpenAI(
@@ -10,7 +36,8 @@ client = OpenAI(
     base_url="https://integrate.api.nvidia.com/v1",
 )
 
-MODEL = "deepseek-ai/deepseek-v3.1"
+# MODEL = "mistralai/devstral-2-123b-instruct-2512"
+MODEL = "mistralai/mistral-medium-3.5-128b"
 
 # ── Shared prompt snippets ────────────────────────────────────────────────────
 

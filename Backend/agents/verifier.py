@@ -66,7 +66,9 @@ def run_verifier(git_diff: str, test_result: dict, architect_plan: str,
         }
     ]
 
-    raw = call_llm(messages, model="deepseek-ai/deepseek-v3.1", temperature=0.0, timeout=30)
+    raw = ""
+    for chunk in call_llm(messages, model="mistralai/devstral-2-123b-instruct-2512", temperature=0.0, timeout=30):
+        raw += chunk
     raw = re.sub(r"```json|```", "", raw).strip()
 
     try:

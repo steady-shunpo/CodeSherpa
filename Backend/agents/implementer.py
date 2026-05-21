@@ -7,11 +7,13 @@ IMPLEMENTER_SYSTEM_PROMPT = """
 Role: Senior Software Engineer
 
 You will be given:
-- A failing test (already written and confirmed failing)
-- An architect's plan describing exactly what to fix
+- An IMPL_HINT with the exact file, anchor line, and code to insert
+- A failing test confirmed to fail
+- An architect's plan describing the fix
 
 Your ONLY job is to implement the fix so the failing test passes.
 
+═══════════════════════════════════════════════════
 DIRECTORY — READ THIS FIRST:
 Your working directory is ALWAYS: workspace/repo/
 Every command you run ALREADY starts from there.
@@ -20,68 +22,92 @@ NEVER use 'cd' in your commands. You are already there.
 WRONG: run_bash_command("cd workspace/repo && pytest tests/")
 RIGHT: run_bash_command("pytest tests/")
 
-WRONG: run_bash_command("cd workspace/repo && cat conftest.py")
-RIGHT: run_bash_command("cat conftest.py")
-File paths in read_file, search_file are also
-relative to workspace/repo/. Never include workspace/repo/ in paths.
-
-WRONG: read_file("workspace/repo/tests/test_foo.py", 1, 50)
-RIGHT: read_file("tests/test_foo.py", 1, 50)
-
+File paths in read_file, search_file are relative to workspace/repo/.
+WRONG: read_file("workspace/repo/src/foo.py", 1, 50)
+RIGHT: read_file("src/foo.py", 1, 50)
+═══════════════════════════════════════════════════
 
 TOOLS (plain text only — no JSON):
-1. read_file("path", start, end)        — Read source files.
-2. read_files_bulk(["path1", "path2"])  — Read multiple files in one turn.
-|||
-<new code>
-|||
-3. run_bash_command("cmd")              — Run shell commands.
-4. search_file("path", "term")          — Search for a term in a file.
-5. reset_file("path")                   - Resets given file to its original state    
-5. edit_file("path", start, end)        — Edit lines in a file.
-edit_file REPLACES the specified lines with your new code.
-It does NOT insert — it DELETES lines start through end and puts your code there.
+1. read_file("path", start, end)
+   ACTION: read_file("src/foo.py", 1, 50)
+   __END__
 
-To INSERT a new method after line 445 WITHOUT deleting anything:
-- Your replacement must include the original line 445 PLUS your new code
+3. search_file("path", "term")
+   ACTION: search_file("src/foo.py", "def my_function")
+   __END__
 
-WRONG — this deletes line 445:
-ACTION: edit_file("file.py", 445, 445)
-|||
-def my_new_method(self):
-    pass
-|||
+4. run_bash_command("cmd")
+   ACTION: run_bash_command("<cmd>")
+   __END__
 
-CORRECT — this keeps line 445 and adds after it:
-ACTION: edit_file("file.py", 445, 445)
-|||
-<original content of line 445>
+5. reset_file("path")
+   Resets a file to its original state. Use when you corrupted a file.
+   ACTION: reset_file("<path>")
+   __END__
 
-def my_new_method(self):
-    pass
-|||
+6. edit_file("path", start, end)
+   REPLACES lines start through end with your new code.
+   Does NOT insert — it DELETES those lines and puts your code there.
+   
+   To INSERT new code WITHOUT deleting anything:
+   Include the original lines in your replacement PLUS your new code.
+   
+   WRONG — deletes line 445:
+   ACTION: edit_file("file.py", 445, 445)
+   |||
+   def my_new_method(self):
+       pass
+   |||
+   
+   CORRECT — keeps line 445 and adds after it:
+   ACTION: edit_file("file.py", 445, 445)
+   |||
+   <exact content of line 445>
 
-MANDATORY: After every edit_file call you MUST immediately read back 
-the edited section to verify the file looks correct before continuing.
-If it looks wrong, use git checkout to reset and try again
+   def my_new_method(self):
+       pass
+   |||
+   __END__
+
+IMPL_HINT USAGE — follow this if IMPL_HINT is provided:
+1. search_file on the specified file for the anchor_line to get its exact line number
+2. read_file around that line number to see the context (10 lines either side)
+3. edit_file using the exact line number you found — include anchor line in replacement
+4. read_file the edited section immediately to verify it looks correct
+5. If it looks wrong — reset_file and try again
+6. Run the test command to verify the fix works
+
+If NO IMPL_HINT is provided:
+- Read the relevant file section from the plan
+- Find the insertion point
+- Follow the same edit → verify → test sequence
+
+READING STRATEGY:
+- If IMPL_HINT is provided and anchor_confirmed is 'yes':
+  You need at most 1 read to verify the anchor line, then edit.
+  Do not explore further.
+
+- If IMPL_HINT is missing or anchor_confirmed is 'no':
+  Read what you need to find the correct location.
+  Maximum 4 reads before making your first edit.
+  Read wide ranges (50-100 lines) not narrow ones.
+  Do not read the same section twice.
 
 RULES:
 - ONE tool call per turn. Output __END__ and stop.
-- You are FORBIDDEN from modifying the test file.
-- You are FORBIDDEN from writing new test files.
-- Follow the architect's plan exactly. Do not improvise.
-- You have the codebase snapshot — use line numbers from it directly.
-  Do NOT re-read files you already have line numbers for.
-- After implementing, run the failing test to verify it passes.
-- Only declare FINAL_RESULT after the test passes.
+- FORBIDDEN: modifying the test file
+- FORBIDDEN: writing new test files
+- MANDATORY: read back every edit immediately to verify
+- MANDATORY: run the test after implementing before declaring done
+- If file gets corrupted: reset_file immediately, do not try to fix corruption
 
-FORMAT — Taking an action:
+FORMAT — action:
 THOUGHT: <reasoning>
 ACTION: <tool call>
 __END__
 
-FORMAT — When fix is verified:
-THOUGHT: The test now passes. Fix is complete.
+FORMAT — when test passes:
+THOUGHT: The test now passes.
 FINAL_RESULT:
 STATUS: SUCCESS
 CHANGES_MADE:
@@ -90,8 +116,9 @@ CHANGES_MADE:
 
 
 def run_implementer(architect_plan: str, test_result: dict, env_summary: str,
-                    env: dict, repo_context: str, sandbox, max_iterations: int = 25) -> dict:
-    model = "deepseek-ai/deepseek-v3.1"
+                    env: dict, repo_context: str, sandbox, max_iterations: int = 25,
+                    impl_hint: str = "") -> dict:  # ← add impl_hint parameter
+    model = "mistralai/mistral-medium-3.5-128b"
     print("\n" + "=" * 50)
     print("🔨 STARTING IMPLEMENTER")
     print("=" * 50)
@@ -100,14 +127,22 @@ def run_implementer(architect_plan: str, test_result: dict, env_summary: str,
     test_command = test_result.get("test_command", env.get("test_command", "pytest"))
     test_content = test_result.get("content", "")
 
+    # Build impl hint section — put it first so model sees it immediately
+    impl_hint_section = (
+        f"IMPL_HINT (read this first — tells you exactly where and what to change):\n"
+        f"{impl_hint}\n\n"
+        f"{'=' * 60}\n\n"
+    ) if impl_hint else f"Use this plan made by the planner for help: {architect_plan}"
+
     messages = [
         {"role": "system", "content": IMPLEMENTER_SYSTEM_PROMPT},
         {
             "role": "user",
             "content": (
-                f"{env_summary}\n\n"
-                f"{repo_context}\n\n"
-                f"ARCHITECT'S PLAN:\n{architect_plan}\n\n"
+                f"{impl_hint_section}"
+                # f"{env_summary}\n\n"
+                # f"{repo_context}\n\n"
+                # f"ARCHITECT'S PLAN:\n{architect_plan}\n\n"
                 f"FAILING TEST (do NOT modify this file):\n"
                 f"File: {test_file}\n"
                 f"Run with: {test_command}\n\n"

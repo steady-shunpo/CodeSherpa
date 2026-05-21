@@ -651,7 +651,7 @@ class CodeGraph:
     # Public API                                                           #
     # ------------------------------------------------------------------ #
 
-    def get_code_graph(self, other_files, mentioned_fnames=None):
+    def get_code_graph(self, other_files, mentioned_fnames=None, on_progress=None):
         if self.max_map_tokens <= 0:
             return [], nx.Graph()
         if not other_files:
@@ -659,13 +659,13 @@ class CodeGraph:
         if not mentioned_fnames:
             mentioned_fnames = set()
 
-        tags = self.get_tag_files(other_files, mentioned_fnames)
+        tags = self.get_tag_files(other_files, mentioned_fnames, on_progress=on_progress)
         code_graph = self.tag_to_graph(tags)
         return tags, code_graph
 
-    def get_tag_files(self, other_files, mentioned_fnames=None):
+    def get_tag_files(self, other_files, mentioned_fnames=None, on_progress=None):
         try:
-            return self.get_ranked_tags(other_files, mentioned_fnames or set())
+            return self.get_ranked_tags(other_files, mentioned_fnames or set(), on_progress=on_progress)
         except RecursionError:
             if self.io:
                 self.io.tool_error("Disabling code graph, git repo too large?")
@@ -744,13 +744,19 @@ class CodeGraph:
     # Tag extraction                                                       #
     # ------------------------------------------------------------------ #
 
-    def get_ranked_tags(self, other_fnames, mentioned_fnames):
+    def get_ranked_tags(self, other_fnames, mentioned_fnames, on_progress=None):
         tags_of_files = []
         personalization = {}
         fnames = sorted(set(other_fnames))
         personalize = 10 / max(len(fnames), 1)
+        total_files = len(fnames)
 
-        for fname in tqdm(fnames):
+        for index, fname in enumerate(tqdm(fnames)):
+        
+            if on_progress and total_files > 0:
+                # Calculate percentage (0 to 100)
+                percent_complete = int(((index + 1) / total_files) * 100)
+                on_progress(percent_complete)
             if not Path(fname).is_file():
                 if fname not in self.warned_files:
                     if self.io:
@@ -986,16 +992,17 @@ def get_random_color():
 # CLI entry-point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    dir_name = sys.argv[1]
 
+    
+
+def build_and_save_repograph(dir_name: str, on_progress=None):
     code_graph = CodeGraph(root=dir_name)
     chat_fnames_new = code_graph.find_files([dir_name])
     print(f"Files found: {len(chat_fnames_new)}")
     if chat_fnames_new:
         print("Sample:", chat_fnames_new[:10])
 
-    tags, G = code_graph.get_code_graph(chat_fnames_new)
+    tags, G = code_graph.get_code_graph(chat_fnames_new, on_progress=on_progress)
 
     print("-" * 60)
     print(f"✅  Code graph built for: {dir_name}")
@@ -1025,3 +1032,17 @@ if __name__ == "__main__":
 
     print(f"📦  Graph  → {graph_path}")
     print(f"📋  Tags   → {tags_path}")
+
+    return graph_path, tags_path
+
+
+
+
+if __name__ == "__main__":
+    dir_name = sys.argv[1]
+    build_and_save_graph(dir_name)
+
+
+
+
+

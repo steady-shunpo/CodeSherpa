@@ -4,6 +4,7 @@ import time
 import hashlib
 import httpx
 from config import client, MODEL, SUPERVISOR_SYSTEM_PROMPT, STUCK_LOOP_INJECTION
+from sandbox_utils import TOOL_PATTERNS
 
 
 # ── Hashing ───────────────────────────────────────────────────────────────────
@@ -12,8 +13,48 @@ def get_reply_hash(text: str) -> str:
     return hashlib.md5(text.strip().encode()).hexdigest()
 
 
-# ── LLM call with streaming, timeout, retry ───────────────────────────────────
-def call_llm(messages: list, model: str, temperature: float = 0.2, timeout: int = 60, retries: int = 3) -> str:
+import re
+
+# ── Tool call completion detector ─────────────────────────────────────────────
+
+class ToolCallDetector:
+    """
+    Scans the accumulated stripped reply for a COMPLETE tool call.
+    'Complete' means the regex fully matches — for multiline tools like
+    edit_file/write_file, this only fires once the closing ``` or ||| lands.
+    Returns (tool_name, match_end_index) or (None, -1).
+    """
+
+    # Order matters: greedy multiline patterns first
+    _ORDERED = [
+        ("edit",      re.compile(r'(?:ACTION:\s*)?edit_file\(\s*"[^"]+"\s*,\s*-?\d+\s*,\s*-?\d+\s*\)\s*(?:\|\|\||```(?:\w+)?)\n.*?(?:\|\|\||```)', re.DOTALL)),
+        ("write",     re.compile(r'(?:ACTION:\s*)?write_file\(\s*"[^"]+"\s*\)\s*(?:\|\|\||```(?:\w+)?)\n.*?(?:\|\|\||```)', re.DOTALL)),
+        # ("read_bulk", re.compile(r'(?:ACTION:\s*)?read_files_bulk\(\s*\[.*?\]\s*\)', re.DOTALL)),
+        ("read",      re.compile(r'(?:ACTION:\s*)?read_file\(\s*"[^"]+"\s*,\s*-?\d+\s*,\s*-?\d+\s*\)')),
+        ("bash",      re.compile(r'(?:ACTION:\s*)?run_bash_command\(\s*"(?:[^"\\]|\\.)*"\s*\)')),
+        ("search",    re.compile(r'(?:ACTION:\s*)?search_file\(\s*"[^"]+"\s*,\s*"[^"]+"\s*\)')),
+        ("reset",     re.compile(r'(?:ACTION:\s*)?reset_file\(\s*"[^"]+"\s*\)')),
+        ("run_test",  re.compile(r'(?:ACTION:\s*)?run_python_test\(\s*"[^"]+"\s*\)')),
+    ]
+
+    def scan(self, stripped: str):
+        """
+        Returns (tool_name, end_index) if a complete tool call is found,
+        else (None, -1).
+        end_index is the position in `stripped` right after the match ends.
+        """
+        for name, pattern in self._ORDERED:
+            m = pattern.search(stripped)
+            if m:
+                return name, m.end()
+        return None, -1
+
+
+_tool_detector = ToolCallDetector()
+
+
+def call_llm(messages: list, model: str, temperature: float = 0.2,
+             timeout: int = 60, retries: int = 3):
     for attempt in range(retries):
         try:
             stream = client.chat.completions.create(
@@ -32,8 +73,9 @@ def call_llm(messages: list, model: str, temperature: float = 0.2, timeout: int 
             REPEAT_WINDOW        = 200
             REPEAT_THRESHOLD     = 3
             THINK_WINDOW         = 150
-            MAX_CHARS            = 15000
-            stripped             = ""  # cached stripped version, recomputed selectively
+            MAX_CHARS            = 6000
+            stripped             = ""
+            tool_call_found      = False   # ← new flag
 
             print()
 
@@ -47,22 +89,30 @@ def call_llm(messages: list, model: str, temperature: float = 0.2, timeout: int 
 
                 full_reply += delta
 
-                # Only print if we're not inside an open think block
-                inside_think = '<think>' in full_reply and '</think>' not in full_reply.split('<think>')[-1] if '<think>' in full_reply else False
+                inside_think = (
+                    '<think>' in full_reply
+                    and '</think>' not in full_reply.split('<think>')[-1]
+                ) if '<think>' in full_reply else False
+
                 if not inside_think:
                     print(delta, end="", flush=True)
+                    yield delta
 
                 # ── Hard length cap ───────────────────────────────────
                 if len(full_reply) > MAX_CHARS:
-                    print(f"\n⚠️ Response exceeded {MAX_CHARS} chars. Force stopping.")
-                    try:
-                        stream.close()
-                    except Exception:
-                        pass
-                    break
+                    if not inside_think:
+                        print(f"\n⚠️ Response exceeded {MAX_CHARS} chars. Force stopping.")
+                        try: stream.close()
+                        except Exception: pass
+                        break
+                    elif len(full_reply) > MAX_CHARS * 3:
+                        print(f"\n⚠️ Think block too long. Force stopping.")
+                        try: stream.close()
+                        except Exception: pass
+                        full_reply = full_reply[:full_reply.rfind('<think>')]
+                        break
 
                 # ── Think block repetition ────────────────────────────
-                # Runs on raw full_reply — we WANT to catch loops inside think tags
                 if '<think>' in full_reply and '</think>' not in full_reply.split('<think>')[-1]:
                     think_content = full_reply.split('<think>')[-1]
                     if len(think_content) > THINK_WINDOW * 2:
@@ -72,63 +122,66 @@ def call_llm(messages: list, model: str, temperature: float = 0.2, timeout: int 
                             think_repeat_counter += 1
                             if think_repeat_counter >= 2:
                                 print(f"\n⚠️ Loop inside think block. Killing stream.")
-                                try:
-                                    stream.close()
-                                except Exception:
-                                    pass
+                                try: stream.close()
+                                except Exception: pass
                                 full_reply = full_reply[:full_reply.rfind('<think>')]
                                 break
                         else:
                             think_repeat_counter = 0
 
-                # ── Recompute stripped version selectively ────────────
-                # Only when a think-relevant or action-relevant token arrived
-                # Avoids running regex on every single chunk
-                if any(t in delta for t in ['<', '>', 'ACTION', 'THOUGHT', 'FINAL', '__END__']) or chunk_count % 30 == 0:
+                # ── Recompute stripped selectively ────────────────────
+                if any(t in delta for t in ['<', '>', 'ACTION', 'THOUGHT', 'FINAL', '__END__',
+                                             'read_', 'write_', 'edit_', 'bash', 'search_',
+                                             'reset_', 'run_', '```', '|||']) \
+                        or chunk_count % 30 == 0:
                     stripped = strip_thinking(full_reply)
-                    if '<think>' in stripped:  # partial open tag remains
+                    if '<think>' in stripped:
                         stripped = stripped[:stripped.rfind('<think>')]
 
-                # ── All action/end/repetition checks on stripped ──────
                 if not stripped:
                     continue
 
-                # Hard stop on __END__
+                # ── Hard stop on __END__ ──────────────────────────────
                 if "__END__" in stripped:
                     full_reply = stripped.split("__END__")[0]
-                    try:
-                        stream.close()
-                    except Exception:
-                        pass
+                    try: stream.close()
+                    except Exception: pass
                     break
 
-                # Stop on second ACTION
+                # ── Early stop: complete tool call detected ───────────
+                tool_name, end_idx = _tool_detector.scan(stripped)
+                if tool_name and not tool_call_found:
+                    tool_call_found = True
+                    print(f"\n✂️ Complete {tool_name} call detected. Cutting stream.")
+                    try: stream.close()
+                    except Exception: pass
+                    # Truncate: keep only up to the end of the tool call
+                    full_reply = stripped[:end_idx]
+                    break
+
+                # ── Second ACTION safeguard (belt-and-suspenders) ─────
                 action_count = stripped.count("ACTION:")
                 if action_count > 1:
                     print(f"\n⚠️ Second ACTION detected. Killing stream.")
-                    try:
-                        stream.close()
-                    except Exception:
-                        pass
+                    try: stream.close()
+                    except Exception: pass
                     first = stripped.index("ACTION:")
                     full_reply = stripped[:stripped.index("ACTION:", first + 1)]
                     break
 
-                # Stop on THOUGHT/FINAL appearing after ACTION
+                # ── THOUGHT/FINAL after ACTION ────────────────────────
                 if "ACTION:" in stripped:
                     after_action = stripped[stripped.index("ACTION:"):]
                     for marker in ["\nTHOUGHT:", "\nFINAL"]:
                         if marker in after_action:
                             print(f"\n⚠️ Model continued after ACTION. Killing stream.")
-                            try:
-                                stream.close()
-                            except Exception:
-                                pass
+                            try: stream.close()
+                            except Exception: pass
                             after_action = after_action[:after_action.index(marker)]
                             full_reply = stripped[:stripped.index("ACTION:")] + after_action
                             break
 
-                # Output repetition — every 50 chunks, fuzzy word match
+                # ── Output repetition ─────────────────────────────────
                 if chunk_count % 50 == 0 and len(stripped) > REPEAT_WINDOW * 2:
                     curr = stripped[-REPEAT_WINDOW:]
                     prev = stripped[-(REPEAT_WINDOW * 2):-REPEAT_WINDOW]
@@ -140,10 +193,8 @@ def call_llm(messages: list, model: str, temperature: float = 0.2, timeout: int 
                             repeat_counter += 1
                             if repeat_counter >= REPEAT_THRESHOLD:
                                 print(f"\n⚠️ Output repetition ({overlap:.0%} overlap). Killing stream.")
-                                try:
-                                    stream.close()
-                                except Exception:
-                                    pass
+                                try: stream.close()
+                                except Exception: pass
                                 full_reply = stripped[:-REPEAT_WINDOW]
                                 break
                         else:
@@ -152,7 +203,6 @@ def call_llm(messages: list, model: str, temperature: float = 0.2, timeout: int 
             print(chunk_count)
             print()
 
-            # Final cleanup — strip any remaining think blocks
             full_reply = strip_thinking(full_reply)
 
             if not full_reply.strip():
@@ -160,7 +210,7 @@ def call_llm(messages: list, model: str, temperature: float = 0.2, timeout: int 
                 time.sleep(5 * (attempt + 1))
                 continue
 
-            return full_reply.strip()
+            return
 
         except httpx.ReadTimeout:
             print(f"\n⏱️ Timeout (attempt {attempt+1}/{retries}). Retrying...")
@@ -305,8 +355,8 @@ def build_tool_result_message(tool_name: str, observation: str, turns_left: int)
         "content": (
             f"[TOOL RESULT — {tool_name}]\n"
             f"The tool ran and returned this output. "
-            f"Do NOT summarize or describe it. "
-            f"Use it to decide your next ACTION.\n\n"
+            # f"Do NOT summarize or describe it. "
+            # f"Use it to decide your next ACTION.\n\n"
             f"{observation}"
             f"{warning}"
         )
@@ -383,23 +433,38 @@ def build_failure_warning(messages: list) -> str:
 
 def summarize_failure(messages: list, model: str, agent_name: str, include_observations: bool = False) -> str:
     history_text = ""
+    print("MESSAGES: ")
+    print(messages[2:8])
     for msg in messages[2:]:
-        role    = msg["role"]
+        role = msg["role"]
         content = msg["content"]
 
+        # -----------------------
+        # ASSISTANT → TOOL CALL
+        # -----------------------
         if role == "assistant":
-            thought = next((l for l in content.splitlines() if l.startswith("THOUGHT:")), "")
-            action  = next((l for l in content.splitlines() if l.startswith("ACTION:")), "")
-            if thought or action:
-                history_text += f"AGENT: {thought} | {action}\n"
-
-        elif role == "user" and content.startswith("TOOL:"):
-            if include_observations:
-                # Full observation capped at 300 chars
-                history_text += f"RESULT: {content[:300]}\n"
+            for tool_name, pattern in TOOL_PATTERNS.items():
+                m = pattern.search(content)
+                if m:
+                    history_text += f"AGENT: {tool_name} -> {m.groups()}\n"
+                    break
             else:
-                # Just the first line — tool name and status
-                history_text += f"RESULT: {content.splitlines()[0]}\n"
+                # fallback if no pattern matched
+                history_text += f"AGENT: {content.strip()}\n"
+
+        # -----------------------
+        # USER → TOOL RESULT
+        # -----------------------
+        elif role == "user":
+            tool_match = re.match(r'\[TOOL RESULT — (.*?)\]', content)
+
+            if tool_match:
+                tool_name = tool_match.group(1)
+
+                if include_observations:
+                    history_text += f"RESULT ({tool_name}): {content[:300]}\n"
+                else:
+                    history_text += f"RESULT ({tool_name})\n"
 
     summary_messages = [
         {
@@ -420,8 +485,13 @@ def summarize_failure(messages: list, model: str, agent_name: str, include_obser
             "content": f"Agent: {agent_name}\n\nAction log:\n{history_text}"
         }
     ]
+    print("HISTORY: " )
+    print(history_text[:100])
 
-    return call_llm(summary_messages, model=model, temperature=0.1, timeout=60, retries=2)
+    full = ""
+    for chunk in call_llm(summary_messages, model=model, temperature=0.1, timeout=60, retries=2):
+        full+=chunk
+    return full
 
 
 
@@ -476,7 +546,9 @@ def run_agent_loop(
         if failure_warning:
             messages_to_send.append({"role": "user", "content": failure_warning})
 
-        raw_reply = call_llm(messages_to_send, model=model, temperature=0.2)
+        raw_reply = ""
+        for chunk in call_llm(messages_to_send, model=model, temperature=0.2):
+            raw_reply += chunk
         if not raw_reply:
             messages.append({"role": "user", "content": "Empty response. Please continue."})
             i += 1
@@ -499,7 +571,10 @@ def run_agent_loop(
                 "role": "user",
                 "content": STUCK_LOOP_INJECTION.format(n=consecutive_identical)
             })
-            raw_reply = call_llm(messages, model=model, temperature=0.7)
+            raw_reply = ""
+
+            for chunk in call_llm(messages, model=model, temperature=0.7):
+                raw_reply += chunk
             reply_history.clear()
 
         # ── Supervisor check every 3 turns ────────────────────────────
@@ -508,25 +583,27 @@ def run_agent_loop(
             verdict = run_supervisor(action_log[-4:])
             if verdict.get("stuck"):
                 print(f"🚨 Supervisor: {verdict['reason']}")
-                env_reminder = ""
-                if env:
-                    env_reminder = (
-                        f"\nEnvironment reminder: "
-                        f"use '{env.get('python_bin', 'python3')}', "
-                        f"run tests with '{env.get('test_command', 'pytest')}'"
-                    )
+                # env_reminder = ""
+                # if env:
+                #     env_reminder = (
+                #         f"\nEnvironment reminder: "
+                #         f"use '{env.get('python_bin', 'python3')}', "
+                #         f"run tests with '{env.get('test_command', 'pytest')}'"
+                #     )
                 messages.append({
                     "role": "user",
                     "content": (
-                        f"Repository infra is complex: {is_complex}"
+                        # f"Repository infra is complex: {is_complex}"
                         f"[SUPERVISOR]: Stuck — {verdict['reason']}\n"
                         f"{verdict.get('intervention', '')}\n"
                         f"FORBIDDEN this turn: read_file, search_file\n"
                         f"REQUIRED this turn: write_file, edit_file, or run_bash_command"
-                        f"{env_reminder}"
+                        # f"{env_reminder}"
                     )
                 })
-                raw_reply = call_llm(messages, model, temperature=0.6)
+                raw_reply = ""
+                for chunk in call_llm(messages, model, temperature=0.6):
+                    raw_reply+=chunk
                 reply_history.clear()
                 action_log.clear()
 
@@ -548,36 +625,49 @@ def run_agent_loop(
 
         # ── Tool execution ────────────────────────────────────────────
         turns_left = max_iters - (i + 1)
-        tool_name, observation = parse_and_execute(agent_reply, sandbox)
-        print(f"\n[{tool_name}]: {observation[:300]}...")
+        tool_name, observation = parse_and_execute(agent_reply, sandbox, env.get("pythonpath"), env.get("pytestflags"))
+        print(f"\n[{tool_name}]: {observation}")
 
         if tool_name == "none":
-            observation = (
-                "ERROR: No valid ACTION detected.\n"
-                f"Response started with: {raw_reply[:120]!r}\n\n"
-                "THOUGHT: ...\nACTION: run_bash_command(\"cmd\")\n__END__\n"
-                "No JSON. Plain text only."
-            )
+            # observation = (
+            #     "ERROR: No valid ACTION detected.\n"
+            #     # f"Response started with: {raw_reply[:120]!r}\n\n"
+            #     # "THOUGHT: ...\nACTION: run_bash_command(\"cmd\")\n__END__\n"
+            #     "No JSON. Plain text only."
+            # )
+            observation=""
 
         messages.append(build_tool_result_message(tool_name, observation, turns_left))
         i += 1
 
     # ── Timeout ───────────────────────────────────────────────────────
     print(f"\n🛑 {agent_name} reached max iterations.")
-    print("Continue (+10 turns)? [t] / Kill [k] / Takeover [p]")
+    print("What would you like to do?")
+    print("  [n] Provide feedback and continue(+10 turns)")
+    print("  [t] Takeover (Halt automation / Launch Co-Pilot later)")
     ans = input().strip().lower()
 
-    if ans == "t":
+    if ans == "n":
+        # messages.append({
+        #     "role": "user",
+        #     "content": "[SYSTEM: 10 more turns granted. Resume exactly where you left off.]"
+        # })
+        # print(messages[-5:])
+        feedback = input("Feedback: ")
         messages.append({
-            "role": "user",
-            "content": "[SYSTEM: 10 more turns granted. Resume exactly where you left off.]"
-        })
-        print(messages[-5:])
+                "role": "user",
+                "content": (
+                    f"User has provided feedback.\nFeedback: {feedback}\n\n"
+                    "[SYSTEM: 10 more turns granted. Continue according to the feedback.]"
+                ) if feedback else(
+                    "[SYSTEM: 10 more turns granted. Resume exactly where you left off.]"
+                )
+            })
         return run_agent_loop(
             messages, parse_and_execute, sandbox,
             10, done_token, agent_name, on_done, model, env
         )
-    elif ans == "p":
+    elif ans == "t":
         # failure_reason = "stuck_loop" if _was_stuck(reply_history) else "max_iterations"
         # explanation = summarize_failure(messages, model, agent_name, True)
         # print(f"\n📋 Agent explanation:\n{explanation}")
@@ -625,8 +715,9 @@ def run_agent_loop_arch(
         # messages_to_send = messages.copy()
         # if failure_warning:
         #     messages_to_send.append({"role": "user", "content": failure_warning})
-
-        raw_reply = call_llm(messages=messages, model=model, temperature=0.2)
+        raw_reply = ""
+        for chunk in call_llm(messages=messages, model=model, temperature=0.2):
+            raw_reply += chunk
         if not raw_reply:
             messages.append({"role": "user", "content": "Empty response. Please continue."})
             i += 1
@@ -649,7 +740,10 @@ def run_agent_loop_arch(
                 "role": "user",
                 "content": STUCK_LOOP_INJECTION.format(n=consecutive_identical)
             })
-            raw_reply = call_llm(messages, model=model, temperature=0.7)
+            full = ""
+            for chunk in call_llm(messages, model=model, temperature=0.7):
+                full += chunk
+            raw_reply = full.strip()
             reply_history.clear()
 
         # ── Supervisor check every 3 turns ────────────────────────────
@@ -713,20 +807,28 @@ def run_agent_loop_arch(
 
     # ── Timeout ───────────────────────────────────────────────────────
     print(f"\n🛑 {agent_name} reached max iterations.")
-    print("Continue (+10 turns)? [t] / Kill [k] / Takeover [p]")
+    print("What would you like to do?")
+    print("  [n] Provide feedback and continue(+10 turns)")
+    print("  [t] Takeover (Halt automation / Launch Co-Pilot later)")
     ans = input().strip().lower()
 
-    if ans == "t":
+    if ans == "n":
+        feedback = input("Feedback: ")
         messages.append({
-            "role": "user",
-            "content": "[SYSTEM: 10 more turns granted. Resume exactly where you left off.]"
-        })
+                "role": "user",
+                "content": (
+                    f"User has provided feedback.\nFeedback: {feedback}\n\n"
+                    "[SYSTEM: 10 more turns granted. Continue according to the feedback.]"
+                ) if feedback else(
+                    "[SYSTEM: 10 more turns granted. Resume exactly where you left off.]"
+                )
+            })
         return run_agent_loop_arch(
             messages, parse_and_execute, sandbox, 
             10, done_token, agent_name, on_done, model, env
         )
     
-    elif ans == "p":
+    elif ans == "t":
         # failure_reason = "stuck_loop" if _was_stuck(reply_history) else "max_iterations"
         # explanation = summarize_failure(messages, model, 'architect', False)
         # print(f"\n📋 Agent explanation:\n{explanation}")

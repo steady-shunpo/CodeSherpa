@@ -33,6 +33,14 @@ function reducer(state, action) {
     case 'START_LOADING':
       return { ...state, phase: 'loading', issueUrl: action.url };
 
+    case 'UPDATE_MESSAGE':
+      return {
+        ...state,
+        messages: state.messages.map(m =>
+          m.id === action.id ? { ...m, text: action.text } : m
+        ),
+      };
+
     case 'LOADING_DONE':
       return {
         ...state,
@@ -41,7 +49,7 @@ function reducer(state, action) {
         messages: [{
           id: 'init',
           role: 'assistant',
-          text: `I've loaded **${action.issue.title}**. I can see this involves ${action.issue.body}. Ask me anything, or hit **Start Pipeline** to run the full automated analysis.`,
+          text: '',   // ← empty, stream fills it
           ts: Date.now(),
         }],
       };

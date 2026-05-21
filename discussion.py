@@ -33,9 +33,7 @@ RULES:
 """
 
 PIPELINE_TRIGGERS = [
-    "run pipeline", "start pipeline", "run it", "start it",
-    "go ahead", "trigger pipeline", "yes", "yeah",
-    "let's go", "lets go", "start", "begin",
+    "run pipeline", "start pipeline", "run it", "start it"
 ]
 
 DISCUSSION_TOOL_PATTERNS = {
@@ -65,6 +63,13 @@ class DiscussionSession:
         self.pipeline_triggered = False
         self.extra_context      = []
 
+    def _collect(self, gen) -> str:
+        """Collects a call_llm generator into a full string."""
+        full = ""
+        for chunk in gen:
+            full += chunk
+        return full.strip()
+
     def process_message(self, user_input: str | None = None) -> dict:
         """
         Processes one message and returns the response.
@@ -80,7 +85,7 @@ class DiscussionSession:
         """
         # ── Initial explanation (no user input yet) ───────────────
         if user_input is None:
-            response = call_llm(self.messages, model=MODEL, temperature=0.3)
+            response = self._collect(call_llm(self.messages, model=MODEL, temperature=0.3))
             self.messages.append({"role": "assistant", "content": response})
             return {
                 "response":           response,
@@ -105,7 +110,7 @@ class DiscussionSession:
             self.extra_context.append(user_input)
 
         self.messages.append({"role": "user", "content": user_input})
-        raw_reply = call_llm(self.messages, model=MODEL, temperature=0.3)
+        raw_reply = self._collect(call_llm(self.messages, model=MODEL, temperature=0.3))
 
         # ── Tool use ──────────────────────────────────────────────
         tool_result = _discussion_parse_and_execute(raw_reply)
@@ -119,7 +124,7 @@ class DiscussionSession:
                 "role":    "user",
                 "content": f"TOOL: {tool_name}\nOBSERVATION:\n{observation}"
             })
-            raw_reply = call_llm(self.messages, model=MODEL, temperature=0.3)
+            raw_reply = self._collect(call_llm(self.messages, model=MODEL, temperature=0.3))
 
         self.messages.append({"role": "assistant", "content": raw_reply})
 
@@ -241,7 +246,10 @@ def get_initial_explanation(messages: list) -> str:
     Gets the chatbot's first response to the issue.
     Called once when the issue is first pasted.
     """
-    response = call_llm(messages, model=MODEL, temperature=0.3)
+    full = ""
+    for chunk in call_llm(messages, model=MODEL, temperature=0.3):
+        full += chunk
+    response = full.strip()
     messages.append({"role": "assistant", "content": response})
     return response
 
