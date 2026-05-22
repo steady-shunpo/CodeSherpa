@@ -261,7 +261,15 @@ def setup_developer_environment(repo_url: str):
         raise ValueError(f"Repo {repo_url} requires system-level dependencies and is not supported.")
 
     print("☁️  Spinning up E2B Sandbox...")
-    sandbox = Sandbox.create(timeout=3000)
+    original_cwd = os.getcwd()
+    import tempfile
+    os.chdir(tempfile.gettempdir())  # move away from project root
+    
+    try:
+        print(f"CWD before sandbox create: {os.getcwd()}")
+        sandbox = Sandbox.create(timeout=3000)
+    finally:
+        os.chdir(original_cwd)
     git_hash = ""
     # ── 1. Clone & checkout ──────────────────────────────────────────────────
     print(f"📦 Cloning {repo_url}...")
