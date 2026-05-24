@@ -264,7 +264,17 @@ async def get_or_build_repograph(
 
     if cached is not None:
         logger.info("Repograph cache hit — skipping build, deleting clone")
-        shutil.rmtree(str(Path(repo_path).parent), ignore_errors=True)
+        
+        graph_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "graph.pkl")
+        tags_path  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tags.jsonl")
+        
+        with open(graph_path, "wb") as f:
+            f.write(cached.graph_pkl)
+        
+        with open(tags_path, "w", encoding="utf-8") as f:
+            for tag in cached.tags_json:
+                f.write(json.dumps(tag) + "\n")
+        
         return {
             "issue_text": issue_text,
             "owner":      owner,
@@ -273,6 +283,8 @@ async def get_or_build_repograph(
             "commit_sha": commit_sha,
             "graph_pkl":  cached.graph_pkl,
             "tags":       cached.tags_json,
+            "graph_path": graph_path,
+            "tags_path":  tags_path,
             "from_cache": True,
         }
 
@@ -309,12 +321,14 @@ async def get_or_build_repograph(
     _cleanup(repo_path, graph_path, tags_path)
 
     return {
-        "issue_text": issue_text,
-        "owner":      owner,
-        "repo_name":  repo_name,
-        "repo_url":   repo_url,
-        "commit_sha": commit_sha,
-        "graph_pkl":  graph_pkl,
-        "tags":       tags,
-        "from_cache": False,
-    }
+            "issue_text": issue_text,
+            "owner":      owner,
+            "repo_name":  repo_name,
+            "repo_url":   repo_url,
+            "commit_sha": commit_sha,
+            "graph_pkl":  graph_pkl,
+            "tags":       tags,
+            "graph_path": graph_path,
+            "tags_path":  tags_path,
+            "from_cache": False,
+        }

@@ -89,7 +89,8 @@ def stage_hint_writer(doc: dict, architect_plan: str, **_) -> tuple[dict, dict |
 def stage_setup(doc: dict, architect_plan: str | None = None, **_) -> tuple[dict, dict | None]:
     """Sandbox + env probe + repo context. Not a user-visible stage, never fails the pipeline."""
     print("\n🖥️  Spinning up sandbox...")
-    time.sleep(60)
+    # time.sleep(60)
+    print("TEST1")
     sandbox, pythonpath, pytestflags = setup_developer_environment(doc["repo_url"])
 
     print("\n🔍 Probing environment...")
