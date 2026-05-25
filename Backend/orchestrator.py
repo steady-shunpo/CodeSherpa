@@ -124,6 +124,15 @@ async def _pause_for_intervention(run_id: str, session: AsyncSession, run: Run, 
     logger.info(f"[{run_id}] Resumed at {stage}")
 
 
+async def _load_checkpoints(session: AsyncSession, run_id: uuid.UUID) -> list[Checkpoint]:
+    result = await session.execute(
+        select(Checkpoint)
+        .where(Checkpoint.run_id == run_id)
+        .order_by(Checkpoint.stage_index)
+    )
+    return result.scalars().all()
+
+
 # ---------------------------------------------------------------------------
 # Delete checkpoints after a given stage_index (used by rewind)
 # ---------------------------------------------------------------------------
@@ -241,26 +250,35 @@ async def orchestrate(run_id: UUID, issue_url: str):
                 logger.info(f"[{run_id}] Running {stage_enum.value}")
 
                 doc, output = await asyncio.to_thread(stage_fn, doc, **ctx)
+                print("OUTPUT: ", output)
 
                 if output is None:
                     # Stage failed — pause for intervention
+                    print("INTERVENTION PAUSE")
                     await _pause_for_intervention(run_id_str, session, run, stage_enum.value)
 
                     # After resume: check if a rewind was requested
                     # (rewind deletes checkpoints and updates run.current_stage)
                     await session.refresh(run)
+                    print("SYNCING CTX")
                     sync_ctx_from_doc(doc, ctx)
+                    print("SYNC DONE")
 
                     if run.current_stage in LINEAR_NAMES:
                         idx = LINEAR_NAMES.index(run.current_stage)
                     continue
-
+                print("CTX UPDATE")
                 ctx.update(output)
+                print("UPDATE DONE")
                 await _write_checkpoint(session, run, stage_enum, output)
+                print("CHECKPOINT WRITTEN")
 
                 # Pause between stages for intervention (Phase 2 hook)
+                print("PAUSING FOR INTERVENTION AGAIN")
                 await _pause_for_intervention(run_id_str, session, run, stage_enum.value)
+                print("DONE")
                 await session.refresh(run)
+                print("SESSION REF DONE")
 
                 idx += 1
 

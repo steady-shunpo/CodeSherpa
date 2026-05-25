@@ -1030,6 +1030,9 @@ def build_and_save_repograph(dir_name: str, on_progress=None):
             })
             f.write(line + "\n")
 
+    print("Exists:", os.path.exists(graph_path))
+    print("Size:", os.path.getsize(graph_path))
+
     print(f"📦  Graph  → {graph_path}")
     print(f"📋  Tags   → {tags_path}")
 

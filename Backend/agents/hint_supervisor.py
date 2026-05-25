@@ -140,7 +140,7 @@ def run_hint_supervisor(hint_text: str, messages_ref: list) -> tuple[bool, str]:
     should_proceed = True  → PASS or WARN, hint proceeds
     should_proceed = False → FAIL, feedback contains what to fix
     """
-    model = "claude-sonnet-4-20250514"
+    model = "mistralai/mistral-medium-3.5-128b"
     SUPERVISOR_MAX_TURNS = 6
 
     print("\n" + "-" * 40)
