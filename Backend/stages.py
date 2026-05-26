@@ -4,7 +4,7 @@ from agents.architect    import run_planner, run_hint_writer
 from agents.test_writer  import run_test_writer
 from agents.implementer  import run_implementer
 from agents.verifier     import run_verifier
-from agents.intervention import intervention_session
+# from agents.intervention import intervention_session
 from llm_utils import extract_test_hint
 # from discussion import run_discussion_loop
 from tools import get_issue, format_issue_for_pipeline, simple_clone

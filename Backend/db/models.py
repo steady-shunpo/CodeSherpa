@@ -17,6 +17,8 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
+from pydantic import Field, BaseModel
+
 from db.database import Base
 
 
@@ -151,6 +153,22 @@ class Message(Base):
         return f"<Message run={self.run_id} stage={self.stage} role={self.role}>"
 
 
+class SendMessageRequest(BaseModel):
+    content: str = Field(..., min_length=1, max_length=8000)
+
+
+class MessageResponse(BaseModel):
+    id: str
+    run_id: str
+    stage: str
+    role: str
+    content: str
+    created_at: datetime
+
+
+class MessagesListResponse(BaseModel):
+    messages: list[MessageResponse]
+    total: int
 # ---------------------------------------------------------------------------
 # Repograph  (cached by repo+commit — shared across runs)
 #
