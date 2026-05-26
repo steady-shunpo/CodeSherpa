@@ -13,14 +13,15 @@ import asyncio
 import logging
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.database import get_db
-from db.models import STAGES, Checkpoint, Run, RunStatus, StageEnum
-from orchestrator import delete_checkpoints_after, orchestrate, signal_resume
+from db.models import STAGES, Checkpoint, Run, RunStatus, StageEnum, MessageResponse, SendMessageRequest, Message, MessagesListResponse
+from orchestrator import delete_checkpoints_after, orchestrate, signal_resume, _get_ctx_for_run
+from agents.intervention import handle_user_message, apply_patches_and_write_checkpoint
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/runs", tags=["runs"])
@@ -213,6 +214,13 @@ async def resume_run(
         # TODO Phase 2: append to doc before next stage runs
         logger.info(f"[{run_id}] Context summary received (Phase 2 — not yet applied)")
 
+
+    await apply_patches_and_write_checkpoint(
+        session,
+        run_id,
+        run.current_stage,
+        run.stage_index,
+    )
     # ── Fire the resume signal ────────────────────────────────────────
     signal_resume(str(run_id))
 
@@ -221,3 +229,94 @@ async def resume_run(
         "resumed": True,
         "from_stage": body.from_stage,
     }
+
+
+
+# ---------------------------------------------------------------------------
+# messages
+# ---------------------------------------------------------------------------
+
+@router.post("/{run_id}/messages", response_model=MessageResponse, status_code=201)
+async def send_message(
+    run_id: UUID,
+    body: SendMessageRequest,
+    session: AsyncSession = Depends(get_db),
+):
+    run = await session.get(Run, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if run.status != RunStatus.AWAITING_INTERVENTION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run is not awaiting intervention (status={run.status}).",
+        )
+
+    # ctx must be retrieved from the live orchestrator task
+    # for now pass empty ctx — tool calls need sandbox which lives in orchestrator
+    ctx = _get_ctx_for_run(str(run_id))  # see note below
+
+    reply = await handle_user_message(
+        session, run_id, run.current_stage, body.content, ctx
+    )
+
+    # Fetch the persisted assistant message to return full model
+    result = await session.execute(
+        select(Message)
+        .where(Message.run_id == run_id, Message.role == "assistant")
+        .order_by(Message.created_at.desc())
+        .limit(1)
+    )
+    assistant_msg = result.scalar_one()
+
+    return MessageResponse(
+        id=str(assistant_msg.id),
+        run_id=str(run_id),
+        stage=assistant_msg.stage,
+        role="assistant",
+        content=reply,
+        created_at=assistant_msg.created_at,
+    )
+
+
+# routes/runs.py — add
+
+@router.get("/{run_id}/messages", response_model=MessagesListResponse)
+async def get_messages(
+    run_id: UUID,
+    stage: str | None = Query(default=None),
+    session: AsyncSession = Depends(get_db),
+):
+    run = await session.get(Run, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    query = select(Message).where(Message.run_id == run_id)
+
+    if stage is not None:
+        valid_stages = [s.value for s in StageEnum]
+        if stage not in valid_stages:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid stage '{stage}'. Valid stages: {valid_stages}",
+            )
+        query = query.where(Message.stage == stage)
+
+    query = query.order_by(Message.created_at)
+    result = await session.execute(query)
+    messages = result.scalars().all()
+
+    return MessagesListResponse(
+        messages=[
+            MessageResponse(
+                id=str(m.id),
+                run_id=str(m.run_id),
+                stage=m.stage,
+                role=m.role,
+                content=m.content,
+                created_at=m.created_at,
+            )
+            for m in messages
+        ],
+        total=len(messages),
+    )

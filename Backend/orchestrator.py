@@ -65,7 +65,7 @@ MAX_PIPELINE_RETRIES = 2  # or import from config
 # One asyncio.Event per run — used to pause between stages for intervention
 # Keyed by run_id (str). Populated on run creation, cleaned up on termination.
 _resume_events: dict[str, asyncio.Event] = {}
-
+_run_contexts: dict[str, dict] = {}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -117,6 +117,8 @@ async def _pause_for_intervention(run_id: str, session: AsyncSession, run: Run, 
         logger.warning(f"[{run_id}] No resume event found — skipping pause")
         return
 
+        
+
     await _set_status(session, run, RunStatus.AWAITING_INTERVENTION, stage)
     logger.info(f"[{run_id}] Paused at {stage} — waiting for resume")
     event.clear()
@@ -124,7 +126,7 @@ async def _pause_for_intervention(run_id: str, session: AsyncSession, run: Run, 
     logger.info(f"[{run_id}] Resumed at {stage}")
 
 
-async def _load_checkpoints(session: AsyncSession, run_id: uuid.UUID) -> list[Checkpoint]:
+async def _load_checkpoints(session: AsyncSession, run_id: UUID) -> list[Checkpoint]:
     result = await session.execute(
         select(Checkpoint)
         .where(Checkpoint.run_id == run_id)
@@ -167,6 +169,7 @@ async def orchestrate(run_id: UUID, issue_url: str):
     _resume_events[run_id_str] = asyncio.Event()
     _resume_events[run_id_str].set()  # not paused initially
 
+
     async with AsyncSessionLocal() as session:
         # Load the Run row
         run = await session.get(Run, run_id)
@@ -204,16 +207,19 @@ async def orchestrate(run_id: UUID, issue_url: str):
                 await _set_status(session, run, RunStatus.FAILED)
                 return
             ctx.update(setup_output)
+            _run_contexts[run_id_str] = ctx
+
 
             # ------------------------------------------------------------------
             # Rebuild doc from any existing checkpoints (crash recovery / rewind)
             # ------------------------------------------------------------------
-            result = await session.execute(
-                select(Checkpoint)
-                .where(Checkpoint.run_id == run_id)
-                .order_by(Checkpoint.stage_index)
-            )
-            existing_checkpoints = result.scalars().all()
+            # result = await session.execute(
+            #     select(Checkpoint)
+            #     .where(Checkpoint.run_id == run_id)
+            #     .order_by(Checkpoint.stage_index)
+            # )
+            # existing_checkpoints = result.scalars().all()
+            existing_checkpoints = await _load_checkpoints(session, run_id)
             if existing_checkpoints:
                 logger.info(f"[{run_id}] Rebuilding doc from {len(existing_checkpoints)} checkpoints")
                 doc = _rebuild_doc_from_checkpoints(doc, existing_checkpoints)
@@ -267,6 +273,8 @@ async def orchestrate(run_id: UUID, issue_url: str):
                     if run.current_stage in LINEAR_NAMES:
                         idx = LINEAR_NAMES.index(run.current_stage)
                     continue
+
+
                 print("CTX UPDATE")
                 ctx.update(output)
                 print("UPDATE DONE")
@@ -280,7 +288,15 @@ async def orchestrate(run_id: UUID, issue_url: str):
                 await session.refresh(run)
                 print("SESSION REF DONE")
 
-                idx += 1
+                #Rebuild in case of rewind
+                fresh_checkpoints = await _load_checkpoints(session, run_id)
+                doc = _rebuild_doc_from_checkpoints(doc, fresh_checkpoints)
+                sync_ctx_from_doc(doc, ctx)
+
+                if run.current_stage in LINEAR_NAMES and run.current_stage != stage_enum.value:
+                    idx = LINEAR_NAMES.index(run.current_stage)
+                else:
+                    idx += 1
 
             # ------------------------------------------------------------------
             # IMPLEMENT + VERIFY retry loop
@@ -381,6 +397,7 @@ async def orchestrate(run_id: UUID, issue_url: str):
 
         finally:
             _resume_events.pop(run_id_str, None)
+            _run_contexts.pop(run_id_str, None)
 
 
 # ---------------------------------------------------------------------------
@@ -422,3 +439,11 @@ def signal_resume(run_id: str):
         logger.info(f"[{run_id}] Resume signal sent")
     else:
         logger.warning(f"[{run_id}] signal_resume called but no event found")
+
+
+
+# ---------------------------------------------------------------------------
+# Helper for intervention ctx
+# ---------------------------------------------------------------------------
+def _get_ctx_for_run(run_id: str) -> dict:
+    return _run_contexts.get(run_id, {})     

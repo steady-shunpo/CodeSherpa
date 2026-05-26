@@ -3,7 +3,11 @@ from sandbox_utils import parse_and_execute
 from llm_utils import run_agent_loop, build_tool_result_message
 import json
 import re
+import httpx
+from sqlalchemy import select, delete
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from db.models import Message, Run, Checkpoint
 
 
 # ═══════════════════════════════════════════════════════════
@@ -120,23 +124,58 @@ def run_intervention_loop(messages: list, sandbox, ctx: dict) -> None:
         # No tool called — agent gave a plain reply, hand back to user
         return
 
+# ── New: DB-aware versions of the session boundaries ─────────────────────────
 
-def intervention_session(doc: dict, ctx: dict) -> tuple[dict, str | None]:
-    sandbox    = ctx.get("sandbox")
-    next_stage = get_next_stage(doc["stage"])
+async def _load_doc_from_checkpoints(session: AsyncSession, run_id) -> dict:
+    result = await session.execute(
+        select(Checkpoint)
+        .where(Checkpoint.run_id == run_id)
+        .order_by(Checkpoint.stage_index)
+    )
+    checkpoints = result.scalars().all()
+    doc = {}
+    for cp in checkpoints:
+        doc.update(cp.output_json)
+    return doc
 
-    print("\n" + "=" * 60)
-    print("🔴 PIPELINE FAILED — INTERVENTION MODE")
-    print("=" * 60)
-    print(f"  Stage     : {doc['stage']}")
-    print(f"  Reason    : {doc['failure_reason']}")
-    print(f"  Summary   : {doc.get('failure_summary', 'n/a')}")
-    print(f"  Resume at : {next_stage or 'n/a'}")
-    print()
-    print("Chat with the assistant to diagnose and fix the issue.")
-    print("Commands: /resume [stage]  |  /abort")
-    print("=" * 60 + "\n")
 
+async def _load_message_history(session: AsyncSession, run_id, stage: str) -> list[dict]:
+    result = await session.execute(
+        select(Message)
+        .where(Message.run_id == run_id, Message.stage == stage)
+        .order_by(Message.created_at)
+    )
+    return [{"role": m.role, "content": m.content} for m in result.scalars().all()]
+
+
+async def _persist_message(
+    session: AsyncSession,
+    run_id,
+    stage: str,
+    role: str,
+    content: str,
+) -> Message:
+    msg = Message(run_id=run_id, stage=stage, role=role, content=content)
+    session.add(msg)
+    await session.commit()
+    await session.refresh(msg)
+    return msg
+
+
+async def create_opening_diagnosis(
+    session: AsyncSession,
+    run_id,
+    stage: str,
+    doc: dict,
+    ctx: dict,
+) -> str:
+    """
+    Called once by the orchestrator right before pausing.
+    Mirrors the CLI's opening turn — seeds the conversation,
+    runs the intervention loop (including any tool calls),
+    persists only the final assistant reply.
+    """
+    sandbox = ctx.get("sandbox")
     messages = [
         {"role": "system", "content": build_intervention_system_prompt(doc)},
         {
@@ -148,39 +187,82 @@ def intervention_session(doc: dict, ctx: dict) -> tuple[dict, str | None]:
         },
     ]
 
-    # Opening diagnosis — agent may immediately read a file here too
+    # Uses your existing tool-calling loop unchanged
     run_intervention_loop(messages, sandbox, ctx)
 
-    while True:
-        user_input = input("You: ").strip()
-        if not user_input:
-            continue
+    # The last assistant message is the opening diagnosis
+    reply = messages[-1]["content"]
 
-        # ── /resume ───────────────────────────────────────────────
-        if user_input.startswith("/resume"):
-            parts = user_input.split()
-            if len(parts) > 1:
-                stage = parts[1]
-                if stage not in PIPELINE_STAGES:
-                    print(f"⚠️  Unknown stage. Choose from: {PIPELINE_STAGES}")
-                    continue
-            else:
-                if next_stage is None:
-                    print("⚠️  No next stage — use /abort.")
-                    continue
-                stage = next_stage
+    # Persist only the assistant reply — seed user turn is synthetic
+    await _persist_message(session, run_id, stage, "assistant", reply)
 
-            patched_doc = apply_pending_patches(doc, messages)
-            patched_doc["status"] = "running"
-            patched_doc["stage"]  = stage
-            print(f"\n▶️  Resuming from: {stage}")
-            return patched_doc, stage
+    return reply
 
-        # ── /abort ────────────────────────────────────────────────
-        if user_input == "/abort":
-            print("🛑 Pipeline aborted by user.")
-            return doc, None
 
-        # ── Normal turn ───────────────────────────────────────────
-        messages.append({"role": "user", "content": user_input})
-        run_intervention_loop(messages, sandbox, ctx)
+async def handle_user_message(
+    session: AsyncSession,
+    run_id,
+    stage: str,
+    user_content: str,
+    ctx: dict,
+) -> str:
+    """
+    Called by POST /runs/{id}/messages for each real user turn.
+    Loads history from DB, runs intervention loop, persists both turns.
+    """
+    sandbox = ctx.get("sandbox")
+    doc = await _load_doc_from_checkpoints(session, run_id)
+    history = await _load_message_history(session, run_id, stage)
+
+    # Rebuild messages list exactly as the CLI did
+    messages = [
+        {"role": "system", "content": build_intervention_system_prompt(doc)},
+        *history,
+        {"role": "user", "content": user_content},
+    ]
+
+    # Persist user turn first
+    await _persist_message(session, run_id, stage, "user", user_content)
+
+    # Run the intervention loop — tool calls happen here if the LLM emits them
+    run_intervention_loop(messages, sandbox, ctx)
+
+    # Last message is the final assistant reply after any tool turns
+    reply = messages[-1]["content"]
+    await _persist_message(session, run_id, stage, "assistant", reply)
+
+    return reply
+
+
+async def apply_patches_and_write_checkpoint(
+    session: AsyncSession,
+    run_id,
+    stage: str,
+    stage_index: int,
+) -> dict:
+    """
+    Called by the resume endpoint before signalling the orchestrator.
+    Scans history for patches, applies them, writes a special checkpoint
+    so the orchestrator picks them up when it rebuilds doc.
+    """
+    doc = await _load_doc_from_checkpoints(session, run_id)
+    history = await _load_message_history(session, run_id, stage)
+
+    patched_doc = apply_pending_patches(doc, history)
+
+    # Find which fields actually changed
+    patches = {k: v for k, v in patched_doc.items() if v != doc.get(k)}
+
+    if patches:
+        # Write as a checkpoint so _rebuild_doc_from_checkpoints picks it up
+        cp = Checkpoint(
+            run_id=run_id,
+            stage=f"intervention_{stage}",   # distinct name, won't collide with stage names
+            stage_index=stage_index,         # same index as the paused stage — replays on top
+            output_json=patches,
+        )
+        session.add(cp)
+        await session.commit()
+        print(f"  ✓ Intervention checkpoint written: {list(patches.keys())}")
+
+    return patched_doc
