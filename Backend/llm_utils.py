@@ -5,7 +5,9 @@ import hashlib
 import httpx
 from config import client, MODEL, SUPERVISOR_SYSTEM_PROMPT, STUCK_LOOP_INJECTION
 from sandbox_utils import TOOL_PATTERNS
-
+from streaming import publish_token
+import asyncio
+# from orchestrator import _notify_awaiting_more_turns
 
 # ── Hashing ───────────────────────────────────────────────────────────────────
 
@@ -511,7 +513,15 @@ def extract_action_line(reply: str) -> str:
 #     return len(set(reply_history[-3:])) == 1
 
 
+
+
+
+
+from db.models import RunStatus
+from db.db_utils import _set_status_sync
+
 def run_agent_loop(
+    run_id: str,
     messages: list,
     parse_and_execute,       # fn(reply, sandbox) -> (tool_name, observation)
     sandbox,
@@ -520,6 +530,7 @@ def run_agent_loop(
     agent_name: str,
     on_done,                 # fn(raw_reply) -> str | None  (None = keep looping)
     model: str,       # optional env dict for supervisor reminders
+    loop: asyncio.AbstractEventLoop,
     env: dict = None, 
     is_complex: bool = None
 ) -> str:
@@ -549,6 +560,7 @@ def run_agent_loop(
         raw_reply = ""
         for chunk in call_llm(messages_to_send, model=model, temperature=0.2):
             raw_reply += chunk
+            publish_token(run_id, chunk, loop)
         if not raw_reply:
             messages.append({"role": "user", "content": "Empty response. Please continue."})
             i += 1
@@ -625,7 +637,7 @@ def run_agent_loop(
 
         # ── Tool execution ────────────────────────────────────────────
         turns_left = max_iters - (i + 1)
-        tool_name, observation = parse_and_execute(agent_reply, sandbox, env.get("pythonpath"), env.get("pytestflags"))
+        tool_name, observation = parse_and_execute(agent_reply, sandbox)
         print(f"\n[{tool_name}]: {observation}")
 
         if tool_name == "none":
@@ -641,40 +653,48 @@ def run_agent_loop(
         i += 1
 
     # ── Timeout ───────────────────────────────────────────────────────
-    print(f"\n🛑 {agent_name} reached max iterations.")
-    print("What would you like to do?")
-    print("  [n] Provide feedback and continue(+10 turns)")
-    print("  [t] Takeover (Halt automation / Launch Co-Pilot later)")
-    ans = input().strip().lower()
+    print(f"\n🛑 {agent_name} reached max iterations ({max_iters}).")
 
-    if ans == "n":
-        # messages.append({
-        #     "role": "user",
-        #     "content": "[SYSTEM: 10 more turns granted. Resume exactly where you left off.]"
-        # })
-        # print(messages[-5:])
-        feedback = input("Feedback: ")
-        messages.append({
-                "role": "user",
-                "content": (
-                    f"User has provided feedback.\nFeedback: {feedback}\n\n"
-                    "[SYSTEM: 10 more turns granted. Continue according to the feedback.]"
-                ) if feedback else(
-                    "[SYSTEM: 10 more turns granted. Resume exactly where you left off.]"
-                )
-            })
-        return run_agent_loop(
-            messages, parse_and_execute, sandbox,
-            10, done_token, agent_name, on_done, model, env
+    # Signal the orchestrator/frontend that we're waiting for a turn grant
+    _set_status_sync(run_id, RunStatus.AWAITING_MORE_TURNS, loop)
+
+    from turn_events import wait_for_grant
+    grant = wait_for_grant(run_id, timeout=3600.0)
+
+    if grant is None:
+        # Timed out waiting — treat as takeover
+        return "TIMEOUT"
+
+    # Build the message to inject based on what the user sent
+    if grant.feedback:
+        injected = (
+            f"User has provided feedback.\nFeedback: {grant.feedback}\n\n"
+            f"[SYSTEM: {grant.extra_turns} more turns granted. "
+            f"Continue according to the feedback.]"
         )
-    elif ans == "t":
-        # failure_reason = "stuck_loop" if _was_stuck(reply_history) else "max_iterations"
-        # explanation = summarize_failure(messages, model, agent_name, True)
-        # print(f"\n📋 Agent explanation:\n{explanation}")
-        # Return both the trigger signal and the explanation
-        return f"TAKEOVER"
-    
-    return "TIMEOUT"
+    else:
+        injected = (
+            f"[SYSTEM: {grant.extra_turns} more turns granted. "
+            f"Resume exactly where you left off.]"
+        )
+
+    messages.append({"role": "user", "content": injected})
+
+    # Recurse with the granted budget
+    return run_agent_loop(
+        run_id=run_id,
+        messages=messages,
+        parse_and_execute=parse_and_execute,
+        sandbox=sandbox,
+        max_iters=grant.extra_turns,
+        done_token=done_token,
+        agent_name=agent_name,
+        on_done=on_done,
+        model=model,
+        loop=loop,
+        env=env,
+        is_complex=is_complex,
+    )
 
 def extract_test_hint(architect_plan: str) -> str:
     if "TEST_HINT:" not in architect_plan:
@@ -683,6 +703,7 @@ def extract_test_hint(architect_plan: str) -> str:
 
 
 def run_agent_loop_arch(
+    run_id  : str,
     messages: list,
     parse_and_execute,       # fn(reply, sandbox) -> (tool_name, observation)
     sandbox,
@@ -690,6 +711,7 @@ def run_agent_loop_arch(
     done_token: str,         # e.g. "FINAL_RESULT:" or "FINAL_PLAN:"
     agent_name: str,
     on_done,                 # fn(raw_reply) -> str | None  (None = keep looping)
+    loop: asyncio.AbstractEventLoop, 
     model: str,       # optional env dict for supervisor reminders
     env: dict = None, 
 ) -> str:
@@ -718,6 +740,8 @@ def run_agent_loop_arch(
         raw_reply = ""
         for chunk in call_llm(messages=messages, model=model, temperature=0.2):
             raw_reply += chunk
+            
+            publish_token(run_id, chunk, loop)
         if not raw_reply:
             messages.append({"role": "user", "content": "Empty response. Please continue."})
             i += 1
@@ -806,33 +830,45 @@ def run_agent_loop_arch(
         i += 1
 
     # ── Timeout ───────────────────────────────────────────────────────
-    print(f"\n🛑 {agent_name} reached max iterations.")
-    print("What would you like to do?")
-    print("  [n] Provide feedback and continue(+10 turns)")
-    print("  [t] Takeover (Halt automation / Launch Co-Pilot later)")
-    ans = input().strip().lower()
+    print(f"\n🛑 {agent_name} reached max iterations ({max_iters}).")
 
-    if ans == "n":
-        feedback = input("Feedback: ")
-        messages.append({
-                "role": "user",
-                "content": (
-                    f"User has provided feedback.\nFeedback: {feedback}\n\n"
-                    "[SYSTEM: 10 more turns granted. Continue according to the feedback.]"
-                ) if feedback else(
-                    "[SYSTEM: 10 more turns granted. Resume exactly where you left off.]"
-                )
-            })
-        return run_agent_loop_arch(
-            messages, parse_and_execute, sandbox, 
-            10, done_token, agent_name, on_done, model, env
+    # Signal the orchestrator/frontend that we're waiting for a turn grant
+    _set_status_sync(run_id, RunStatus.AWAITING_MORE_TURNS, loop)
+
+    from turn_events import wait_for_grant
+    grant = wait_for_grant(run_id, timeout=3600.0)
+
+    if grant is None:
+        # Timed out waiting — treat as takeover
+        return "TIMEOUT"
+
+    # Build the message to inject based on what the user sent
+    if grant.feedback:
+        injected = (
+            f"User has provided feedback.\nFeedback: {grant.feedback}\n\n"
+            f"[SYSTEM: {grant.extra_turns} more turns granted. "
+            f"Continue according to the feedback.]"
         )
-    
-    elif ans == "t":
-        # failure_reason = "stuck_loop" if _was_stuck(reply_history) else "max_iterations"
-        # explanation = summarize_failure(messages, model, 'architect', False)
-        # print(f"\n📋 Agent explanation:\n{explanation}")
-        # Return both the trigger signal and the explanation
-        return f"TAKEOVER"
-    
-    return "TIMEOUT"
+    else:
+        injected = (
+            f"[SYSTEM: {grant.extra_turns} more turns granted. "
+            f"Resume exactly where you left off.]"
+        )
+
+    messages.append({"role": "user", "content": injected})
+
+    # Recurse with the granted budget
+    return run_agent_loop_arch(
+        run_id=run_id,
+        messages=messages,
+        parse_and_execute=parse_and_execute,
+        sandbox=sandbox,
+        max_iters=grant.extra_turns,
+        done_token=done_token,
+        agent_name=agent_name,
+        on_done=on_done,
+        model=model,
+        loop=loop,
+        env=env,
+        # is_complex=is_complex,
+    )

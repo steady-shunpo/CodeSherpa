@@ -31,6 +31,7 @@ class RunStatus(str, Enum):
     DISCUSSING             = "discussing"            # pre-run chat (Phase 2)
     STAGE_RUNNING          = "stage_running"         # an agent is actively running
     AWAITING_INTERVENTION  = "awaiting_intervention" # paused between stages
+    AWAITING_MORE_TURNS    = "awaiting_more_turns"   # paused after out of turns
     BLOCKED_ON_HUMAN       = "blocked_on_human"      # retries exhausted, needs human
     SUCCEEDED              = "succeeded"             # terminal ✓
     FAILED                 = "failed"                # terminal ✗
@@ -89,6 +90,10 @@ class Run(Base):
     messages: Mapped[list["Message"]] = relationship(
         "Message", back_populates="run", order_by="Message.created_at"
     )
+
+    # Turns for continue:
+    turns_remaining: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    turns_used:      Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     def __repr__(self) -> str:
         return f"<Run id={self.id} status={self.status} stage={self.current_stage}>"

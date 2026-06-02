@@ -17,24 +17,35 @@ from db.models import Message, Run, Checkpoint
 INTERVENTION_SYSTEM_PROMPT = """\
 You are a pipeline repair assistant. The user's autonomous GitHub coding pipeline has failed.
 
-Your goals:
-1. Help the user understand WHY the pipeline failed, using the failure doc below
-2. Investigate the repo if needed using read_file, read_files_bulk, or search_file
-3. Help the user decide what to fix, and emit patch blocks for any doc fields they want to change
+## Your behavior rules (follow strictly):
+- ALWAYS investigate before explaining. Do not describe what you *would* read — read it.
+- If the failure references a file, a test, or a module: read it immediately in your first ACTION.
+- Never say "I'll look at X" — just look at X.
+- Only emit a THOUGHT/ACTION turn. Never respond in plain prose until you have enough context.
+
+## Workflow:
+1. Read the failure doc carefully.
+2. Identify the most likely root cause location (file, test, config).
+3. Use read_file / search_file to confirm — do this in your FIRST turn, unprompted.
+4. Once you have evidence, explain the root cause to the user with specific line references.
+5. Propose a fix. If the user agrees, emit the appropriate patch block.
+
+## Turn format — use this for every turn until root cause is confirmed:
+THOUGHT: <what you know so far and what you need to check>
+ACTION: read_file("path/to/file", start_line, end_line)
+__END__
 
 ## Available tools (read-only):
 - read_file("path/to/file", start_line, end_line)
 - search_file("path/to/file", "search term")
 
-Use the same THOUGHT / ACTION / __END__ format as the other agents.
-
-## Patchable doc fields — emit these when the user is ready to fix something:
-<patch field="test_hint">corrected hint here</patch>
-<patch field="impl_hint">corrected hint here</patch>
+## Patchable doc fields — emit when the user confirms what to fix:
+<patch field="test_hint">corrected test hint here</patch>
+<patch field="impl_hint">corrected implementation hint here</patch>
 <patch field="architect_plan">revised plan here</patch>
 <patch field="user_issue">clarified issue here</patch>
 
-## Resume commands (remind the user when they're ready):
+## Resume commands:
   /resume <stage>   — continue from a specific stage
   /resume           — continue from the next stage automatically
   /abort            — stop the pipeline
@@ -42,7 +53,7 @@ Use the same THOUGHT / ACTION / __END__ format as the other agents.
 ## Pipeline stage order:
 planner → hint_writer → test_writer → implementer → verifier
 
-Reason only from what's in the failure doc and what you read from the repo.
+Reason only from evidence you have read. Never speculate from the failure doc alone.
 """
 
 PIPELINE_STAGES = ["planner", "hint_writer", "test_writer", "implementer", "verifier"]
@@ -56,15 +67,22 @@ def get_next_stage(failed_stage: str) -> str | None:
         return None
 
 
-def build_intervention_system_prompt(doc: dict) -> str:
-    next_stage = get_next_stage(doc["stage"])
+def build_intervention_system_prompt(doc: dict, stage: str) -> str:
+
+    next_stage = get_next_stage(stage)
     return (
         INTERVENTION_SYSTEM_PROMPT
-        + f"\n\n## Current failure doc:\n{json.dumps(doc, indent=2)}"
-        + f"\n\n## Failed at stage: {doc['stage']}"
+        + f"\n\n## Current failure doc:\n{json.dumps(doc, indent=2, cls=BytesEncoder)}"
+        + f"\n\n## Failed at stage: {stage}"
         + f"\n## Suggested resume point: {next_stage or '(last stage — cannot resume further)'}"
     )
 
+
+class BytesEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, bytes):
+            return o.decode('utf-8', errors='replace') # Gracefully handles non-utf8 bytes too
+        return super().default(o)
 
 # ═══════════════════════════════════════════════════════════
 #  APPLY PATCHES
@@ -112,7 +130,7 @@ def run_intervention_loop(messages: list, sandbox, ctx: dict) -> None:
         print(f"\n🤖 Assistant: {raw_reply}\n")
 
         tool_name, observation = parse_and_execute(
-            raw_reply, sandbox, env.get("pythonpath"), env.get("pytestflags")
+            raw_reply, sandbox
         )
 
         if tool_name != "none":
@@ -177,7 +195,7 @@ async def create_opening_diagnosis(
     """
     sandbox = ctx.get("sandbox")
     messages = [
-        {"role": "system", "content": build_intervention_system_prompt(doc)},
+        {"role": "system", "content": build_intervention_system_prompt(doc, stage)},
         {
             "role": "user",
             "content": (
@@ -216,7 +234,7 @@ async def handle_user_message(
 
     # Rebuild messages list exactly as the CLI did
     messages = [
-        {"role": "system", "content": build_intervention_system_prompt(doc)},
+        {"role": "system", "content": build_intervention_system_prompt(doc, stage)},
         *history,
         {"role": "user", "content": user_content},
     ]

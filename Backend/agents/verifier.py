@@ -1,5 +1,6 @@
 from llm_utils import call_llm
 from sandbox_utils import run_remote_command
+from streaming import publish_token
 
 
 VERIFIER_SYSTEM_PROMPT = """
@@ -26,9 +27,9 @@ Output ONLY this JSON:
 }
 """
 
-
-def run_verifier(git_diff: str, test_result: dict, architect_plan: str,
-                 env: dict, sandbox) -> dict:
+import asyncio
+def run_verifier(run_id: str, git_diff: str, test_result: dict, architect_plan: str,
+                 env: dict, loop: asyncio.AbstractEventLoop, sandbox) -> dict:
     print("\n" + "=" * 50)
     print("✅ STARTING VERIFIER")
     print("=" * 50)
@@ -69,6 +70,7 @@ def run_verifier(git_diff: str, test_result: dict, architect_plan: str,
     raw = ""
     for chunk in call_llm(messages, model="mistralai/devstral-2-123b-instruct-2512", temperature=0.0, timeout=30):
         raw += chunk
+        publish_token(run_id, chunk, loop)
     raw = re.sub(r"```json|```", "", raw).strip()
 
     try:
@@ -84,6 +86,14 @@ def run_verifier(git_diff: str, test_result: dict, architect_plan: str,
             "issues":            [],
             "summary":           "LLM verdict parsing failed — inferred from output."
         }
+
+    if run_id:
+        from streaming import get_queue, STREAM_DONE
+        import asyncio
+        queue = get_queue(run_id)
+        if queue:
+            # loop = asyncio.get_event_loop()
+            loop.call_soon_threadsafe(queue.put_nowait, STREAM_DONE)
 
     print(f"\n🏁 Verifier verdict: {verdict.get('verdict')} — {verdict.get('summary')}")
     return verdict

@@ -13,6 +13,7 @@ from failure_doc import (
     create_failure_doc, finalize_failure_doc,
     # finalize_success_doc, get_latest_doc
 )
+import asyncio
 
 
 # Your existing sandbox setup function
@@ -31,9 +32,9 @@ MAX_PIPELINE_RETRIES = 2  # how many times to retry the full impl+verify loop
 #  STAGE FUNCTIONS
 # ═══════════════════════════════════════════════════════════
 
-def stage_planner(doc: dict, **_) -> tuple[dict, dict | None]:
+def stage_planner(doc: dict, run_id: str, loop: asyncio.AbstractEventLoop, **_) -> tuple[dict, dict | None]:
     doc["stage"] = "planner"
-    result = run_planner(doc["user_issue"])
+    result = run_planner(doc["user_issue"], run_id, loop)
 
     doc["architect_plan"] = result.get("content", "")
 
@@ -53,9 +54,9 @@ def stage_planner(doc: dict, **_) -> tuple[dict, dict | None]:
     return doc, {"architect_plan": result["content"]}
 
 
-def stage_hint_writer(doc: dict, architect_plan: str, **_) -> tuple[dict, dict | None]:
+def stage_hint_writer(doc: dict, run_id: str, architect_plan: str, loop: asyncio.AbstractEventLoop, **_) -> tuple[dict, dict | None]:
     doc["stage"] = "hint_writer"
-    result = run_hint_writer(architect_plan)
+    result = run_hint_writer(architect_plan, run_id, loop)
 
     test_hint, impl_hint = "", ""
     doc['test_hint'] = result.get("content", "")
@@ -117,10 +118,13 @@ def stage_test_writer(
     repo_context,
     sandbox,
     test_hint: str,
+    run_id: str,
+    loop: asyncio.AbstractEventLoop,
     **_,
 ) -> tuple[dict, dict | None]:
     doc["stage"] = "test_writer"
     result = run_test_writer(
+        run_id         = run_id,
         architect_plan = architect_plan,
         user_issue     = doc["user_issue"],
         env_summary    = env_summary,
@@ -129,6 +133,7 @@ def stage_test_writer(
         sandbox        = sandbox,
         max_iterations = 20,
         test_hint      = test_hint,
+        loop           = loop,
     )
 
     doc["test_result"] = {
@@ -150,7 +155,7 @@ def stage_test_writer(
             failure_reason = result.get("reason", "max_iterations"),
             messages       = result.get("messages", []),
             model          = "mistralai/mistral-medium-3.5-128b",
-            sandbox        = sandbox,
+            # sandbox        = sandbox,
         ), None
 
     print(f"\n🧪 Failing test ready: {result.get('test_file', 'unknown')}")
@@ -172,10 +177,13 @@ def stage_implementer(
     sandbox,
     impl_hint: str,
     attempt: int,
+    run_id: str,
+    loop: asyncio.AbstractEventLoop,
     **_,
 ) -> tuple[dict, dict | None]:
     doc["stage"] = "implementer"
     result = run_implementer(
+        run_id         = run_id,
         architect_plan = architect_plan,
         test_result    = test_result,
         env_summary    = env_summary,
@@ -184,6 +192,7 @@ def stage_implementer(
         sandbox        = sandbox,
         max_iterations = 25,
         impl_hint      = impl_hint,
+        loop           = loop,
     )
     doc["partial_diff"] = result.get("git_diff", "")
 
@@ -197,7 +206,7 @@ def stage_implementer(
                 failure_reason = result.get("reason", "max_iterations"),
                 messages       = result.get("messages", []),
                 model          = "mistralai/devstral-2-123b-instruct-2512",
-                sandbox        = sandbox,
+                # sandbox        = sandbox,
             ), None
         print("🔄 Resetting git state for retry...")
         sandbox.commands.run("cd workspace/repo && git checkout . && git clean -fd")
@@ -215,15 +224,19 @@ def stage_verifier(
     env: dict,
     sandbox,
     attempt: int,
+    run_id: str,
+    loop: asyncio.AbstractEventLoop,
     **_,
 ) -> tuple[dict, dict | None]:
     doc["stage"] = "verifier"
     verdict = run_verifier(
+        run_id         = run_id,
         git_diff       = impl_result["git_diff"],
         test_result    = test_result,
         architect_plan = architect_plan,
         env            = env,
         sandbox        = sandbox,
+        loop           = loop,
     )
     doc["verifier_verdict"] = verdict
 
@@ -245,7 +258,7 @@ def stage_verifier(
         failure_reason = "verifier_failed",
         messages       = [],
         model          = "mistralai/devstral-2-123b-instruct-2512",
-        sandbox        = sandbox,
+        # sandbox        = sandbox,
     ), None
 
 

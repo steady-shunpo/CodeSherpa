@@ -2,6 +2,7 @@ import { useApp } from '../store/appStore';
 
 export default function LoadingScreen() {
   const { state } = useApp();
+  console.log("state: ", state)
   const short = state.issueUrl.replace(/^https?:\/\//, '');
 
   return (

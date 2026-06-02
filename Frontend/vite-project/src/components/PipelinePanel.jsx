@@ -1,30 +1,37 @@
 import { useEffect } from 'react';
 import { useApp } from '../store/appStore';
-import { streamAgent } from '../utils/api';
+// import { streamAgent } from '../utils/api';
 import AgentCard from './AgentCard';
+import { useSSEStream } from '../utils/api';
+
 
 export default function PipelinePanel() {
   const { state, dispatch } = useApp();
-  const { agents, currentAgentIdx } = state;
+  const { agents, currentAgentIdx, runId } = state;
+
+  useSSEStream(runId);
+
+  // const doneCount = agents.filter(a => a.status === 'done').length;
+  // const progress = (doneCount / agents.length) * 100;
 
   // Drive the current agent's stream
-  useEffect(() => {
-    const agent = agents[currentAgentIdx];
-    if (!agent || agent.status !== 'running') return;
+  // useEffect(() => {
+  //   const agent = agents[currentAgentIdx];
+  //   if (!agent || agent.status !== 'running') return;
 
-    let cancelled = false;
-    async function run() {
-      for await (const chunk of streamAgent(agent.id)) {
-        if (cancelled) return;
-        dispatch({ type: 'AGENT_STREAM_CHUNK', idx: currentAgentIdx, chunk });
-      }
-      if (!cancelled) {
-        dispatch({ type: 'AGENT_AWAITING', idx: currentAgentIdx });
-      }
-    }
-    run();
-    return () => { cancelled = true; };
-  }, [currentAgentIdx, agents[currentAgentIdx]?.status]);
+  //   let cancelled = false;
+  //   async function run() {
+  //     for await (const chunk of streamAgent(agent.id)) {
+  //       if (cancelled) return;
+  //       dispatch({ type: 'AGENT_STREAM_CHUNK', idx: currentAgentIdx, chunk });
+  //     }
+  //     if (!cancelled) {
+  //       dispatch({ type: 'AGENT_AWAITING', idx: currentAgentIdx });
+  //     }
+  //   }
+  //   // run();
+  //   return () => { cancelled = true; };
+  // }, [currentAgentIdx, agents[currentAgentIdx]?.status]);
 
   // Progress bar
   const doneCount = agents.filter(a => a.status === 'done').length;

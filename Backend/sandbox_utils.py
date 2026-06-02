@@ -12,6 +12,8 @@ TOOL_PATTERNS = {
     "read_bulk": re.compile(r'(?:ACTION:\s*)?read_files_bulk\(\s*\[(.*?)\]\s*\)', re.DOTALL),
     "reset_file":re.compile(r'(?:ACTION:\s*)?reset_file\(\s*"([^"]+)"\s*\)'),
     "search": re.compile(r'(?:ACTION:\s*)?search_repo\(\s*["\']([^"\']+)["\']\s*\)',),
+    # "read_no_lines": re.compile(r'(?:ACTION:\s*)?read_file\(\s*"([^"]+)"\s*\)\s*(?:$|\n|__END__)'),
+    "line_count":    re.compile(r'(?:ACTION:\s*)?line_count\(\s*"([^"]+)"\s*\)'),
 }
 
 def parse_and_execute(agent_reply: str, sandbox) -> tuple[str, str]:
@@ -71,16 +73,16 @@ def parse_and_execute(agent_reply: str, sandbox) -> tuple[str, str]:
         result = run_remote_command(sandbox, f"cd workspace/repo && git checkout {fp}")
         return "reset_file", f"Reset {fp} to original state. Start fresh."
 
-    if m := TOOL_PATTERNS["read_no_lines"].search(agent_reply):
-        fp = m.group(1)
-        return "read_file", (
-            f"ERROR: read_file requires line numbers.\n"
-            f"You called: read_file(\"{fp}\")\n"
-            f"Correct usage:\n"
-            f"  read_file(\"{fp}\", 1, 50)     — read first 50 lines\n"
-            f"  read_file(\"{fp}\", 1, -1)     — read entire file\n"
-            f"Tip: use line_count(\"{fp}\") first to see how many lines the file has."
-        )
+    # if m := TOOL_PATTERNS["read_no_lines"].search(agent_reply):
+    #     fp = m.group(1)
+    #     return "read_file", (
+    #         f"ERROR: read_file requires line numbers.\n"
+    #         f"You called: read_file(\"{fp}\")\n"
+    #         f"Correct usage:\n"
+    #         f"  read_file(\"{fp}\", 1, 50)     — read first 50 lines\n"
+    #         f"  read_file(\"{fp}\", 1, -1)     — read entire file\n"
+    #         f"Tip: use line_count(\"{fp}\") first to see how many lines the file has."
+    #     )
 
     if m := TOOL_PATTERNS["line_count"].search(agent_reply):
         fp = m.group(1)

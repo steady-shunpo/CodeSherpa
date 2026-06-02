@@ -5,10 +5,14 @@ import IdleScreen from './IdleScreen';
 import LoadingScreen from './LoadingScreen';
 import ChatPanel from './ChatPanel';
 import PipelinePanel from './PipelinePanel';
+import { useRunPoller } from '../hooks/useRunPoller';  // ← add
+
 
 export default function MainLayout() {
   const { state } = useApp();
   const { phase } = state;
+
+  useRunPoller();
 
   const showPipeline = phase === 'pipeline';
 

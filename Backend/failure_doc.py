@@ -1,6 +1,9 @@
-import datetime
 import os
 from llm_utils import call_llm
+import os
+import json
+from datetime import datetime
+import re
 
 def create_failure_doc(repo_url: str, user_issue: str) -> dict:
     """
@@ -37,16 +40,20 @@ def create_failure_doc(repo_url: str, user_issue: str) -> dict:
     }
 
 
-import os
-import json
-from datetime import datetime
-import re
 
 TOOL_NAMES = {
     "edit_file", "write_file", "read_files_bulk", "read_file",
     "run_bash_command", "search_file", "reset_file", "line_count",
     "search_repo", "none",
 }
+
+
+class BytesEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, bytes):
+            return o.decode('utf-8', errors='replace') # Gracefully handles non-utf8 bytes too
+        return super().default(o)
+    
 
 def _trim_messages_for_summary(messages: list) -> list:
     trimmed = []
@@ -113,7 +120,7 @@ def finalize_failure_doc(
                     "2. What steps it took\n"
                     "3. Where it got stuck or went wrong\n"
                     "4. The likely root cause\n\n"
-                    f"Messages:\n{json.dumps(trimmed, indent=2)}"
+                    f"Messages:\n{json.dumps(trimmed, indent=2, cls=BytesEncoder)}"
                 ),
             }
         ]
@@ -134,6 +141,6 @@ def finalize_failure_doc(
     os.makedirs("runs", exist_ok=True)
     filepath = os.path.join("runs", filename)
     with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(doc, f, indent=2, ensure_ascii=False)
+        json.dump(doc, f, indent=2, ensure_ascii=False, cls=BytesEncoder)
 
     return doc

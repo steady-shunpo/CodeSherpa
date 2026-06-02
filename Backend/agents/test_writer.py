@@ -422,9 +422,9 @@ FAILURE_OUTPUT:
 
 
 
-
-def run_test_writer(architect_plan: str, user_issue: str, env_summary: str, env: dict,
-                    repo_context: str, sandbox, test_hint: str, max_iterations: int = 30) -> dict:
+import asyncio
+def run_test_writer(run_id: str, architect_plan: str, user_issue: str, env_summary: str, env: dict,
+                    repo_context: str, sandbox, test_hint: str, loop: asyncio.AbstractEventLoop, max_iterations: int = 30) -> dict:
     model = "mistralai/mistral-medium-3.5-128b"
     print("\n" + "=" * 50)
     print("🧪 STARTING TEST WRITER")
@@ -476,30 +476,31 @@ def run_test_writer(architect_plan: str, user_issue: str, env_summary: str, env:
 
     def on_done(raw_reply: str, msgs: list):
         print("\n✅ Test Writer reports a failing test.")
-        decision = checkpoint_gate("TestWriter", raw_reply)
+        # decision = checkpoint_gate("TestWriter", raw_reply, run_id, loop)
 
-        if decision["status"] == "PROCEED":
-            result_holder["result"] = raw_reply
-            return raw_reply
+        # if decision["status"] == "PROCEED":
+        #     result_holder["result"] = raw_reply
+        #     return raw_reply
 
-        elif decision["status"] == "RETRY":
-            msgs.append({
-                "role": "user",
-                "content": (
-                    f"Your test was rejected.\nFeedback: {decision['feedback']}\n\n"
-                    "Fix the test and confirm it fails before trying again."
-                )
-            })
-            return None
+        # elif decision["status"] == "RETRY":
+        #     msgs.append({
+        #         "role": "user",
+        #         "content": (
+        #             f"Your test was rejected.\nFeedback: {decision['feedback']}\n\n"
+        #             "Fix the test and confirm it fails before trying again."
+        #         )
+        #     })
+        #     return None
 
-        elif decision["status"] == "TAKEOVER":
-            # explanation = summarize_failure(messages, model, "test_writer", True)
-            return "TAKEOVER"
+        # elif decision["status"] == "TAKEOVER":
+        #     # explanation = summarize_failure(messages, model, "test_writer", True)
+        #     return "TAKEOVER"
 
         result_holder["result"] = raw_reply
         return raw_reply
 
     result = run_agent_loop(
+        run_id            = run_id,
         messages          = messages,
         model= model,
         parse_and_execute = parse_and_execute,
@@ -508,14 +509,25 @@ def run_test_writer(architect_plan: str, user_issue: str, env_summary: str, env:
         done_token        = ("FINAL_RESULT" or "FINAL RESULT" or "Final Result" or "Final result"),
         agent_name        = "🧪 TestWriter",
         on_done           = on_done,
+        loop              = loop,
         env               = env,
-        is_complex        = infra["is_complex"]
+        is_complex        = False
     )
 
 
     # Extract test file and command from the FINAL_RESULT block
     test_file    = _extract_field(result, "TEST_FILE:")
     test_command = _extract_field(result, "TEST_COMMAND:")
+
+    if run_id:
+        from streaming import get_queue, STREAM_DONE
+        # import asyncio
+        queue = get_queue(run_id)
+        if queue:
+            # loop = asyncio.get_event_loop()
+            loop.call_soon_threadsafe(queue.put_nowait, STREAM_DONE)
+
+
     if "TAKEOVER" in result:
         return {
             "status":   "failed",

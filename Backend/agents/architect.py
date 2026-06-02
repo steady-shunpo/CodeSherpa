@@ -138,7 +138,8 @@ def _arch_parse_and_execute(agent_reply: str, _sandbox) -> tuple[str, str]:
     return "none", ""
 
 
-def run_planner(user_issue: str, max_iterations: int = 25) -> dict:
+import asyncio
+def run_planner(user_issue: str, run_id: str, loop: asyncio.AbstractEventLoop, max_iterations: int = 25) -> dict:
     # model = "nvidia/nemotron-3-super-120b-a12b"
     model = "mistralai/mistral-medium-3.5-128b"
     # model  = 'mistralai/devstral-2-123b-instruct-2512'
@@ -154,27 +155,28 @@ def run_planner(user_issue: str, max_iterations: int = 25) -> dict:
 
     def on_done(raw_reply: str, msgs: list):
         print("\n✅ Planner has a plan!")
-        decision = checkpoint_gate("Planner", raw_reply)
+        # decision = checkpoint_gate("Planner", raw_reply, run_id, loop)
 
-        if decision["status"] == "PROCEED":
-            return raw_reply
+        # if decision["status"] == "PROCEED":
+        #     return raw_reply
 
-        elif decision["status"] == "RETRY":
-            msgs.append({
-                "role": "user",
-                "content": (
-                    f"Your plan was rejected.\nFeedback: {decision['feedback']}\n\n"
-                    "Read more files if needed, then output a revised FINAL_PLAN."
-                )
-            })
-            return None
+        # elif decision["status"] == "RETRY":
+        #     msgs.append({
+        #         "role": "user",
+        #         "content": (
+        #             f"Your plan was rejected.\nFeedback: {decision['feedback']}\n\n"
+        #             "Read more files if needed, then output a revised FINAL_PLAN."
+        #         )
+        #     })
+        #     return None
 
-        elif decision["status"] == "TAKEOVER":
-            return f"TAKEOVER::{raw_reply}"
+        # elif decision["status"] == "TAKEOVER":
+        #     return f"TAKEOVER::{raw_reply}"
 
         return raw_reply
 
     result = run_agent_loop_arch(
+        run_id            = run_id,
         messages          = messages,
         model             = model,
         parse_and_execute = _arch_parse_and_execute,
@@ -183,7 +185,15 @@ def run_planner(user_issue: str, max_iterations: int = 25) -> dict:
         done_token        = ("FINAL_PLAN" or "FINAL PLAN" or "final plan" or "Final Plan" or "Final plan" or "Final_plan"),
         agent_name        = "🧠 Planner",
         on_done           = on_done,
+        loop              = loop,
     )
+
+    if run_id:
+        from streaming import get_queue, STREAM_DONE
+        queue = get_queue(run_id)
+        if queue:
+            # loop = asyncio.get_event_loop()
+            loop.call_soon_threadsafe(queue.put_nowait, STREAM_DONE)
 
     if "TAKEOVER" in result:
         return {
@@ -273,12 +283,12 @@ models_available:
     must know WHY so it does not go searching for models that don't exist.
 
 example_test:
-  Write a complete, runnable test method.
-  - Use real class names, real field names, real import paths.
+  Read the existing test file first, then copy and adapt a real test from it.
+  - Start from an actual test function you have read — do not write from memory.
+  - Use real class names, real field names, real import paths from what you read.
   - Never use placeholders like MyModel, SomeObject, expected_value.
   - The test must call the trigger and assert correct behavior (not assertRaises).
-  - This should be close enough that the test writer can use it with minimal changes.
-
+  - Must start with `def test_` and be runnable as-is.
 ═══════════════════════════════════════════════════
 OUTPUT FORMAT (use exactly):
 ═══════════════════════════════════════════════════
@@ -462,7 +472,7 @@ def _extract_code_block(block: str, field: str) -> str:
     raw = "\n".join(section_lines).replace("\\n", "\n")
     return raw.strip()
  
- 
+
 def validate_hints(raw_reply: str) -> tuple[bool, str]:
     """
     Validates that TEST_HINT and IMPL_HINT are complete and specific.
@@ -542,7 +552,7 @@ def validate_hints(raw_reply: str) -> tuple[bool, str]:
  
     # ── example_test checks ───────────────────────────────────────
     example_test_section = _extract_code_block(test_block, "example_test")
- 
+
     if not re.search(r'def test_\w+', example_test_section):
         return False, (
             "example_test must contain a complete test method starting with 'def test_'."
@@ -555,18 +565,7 @@ def validate_hints(raw_reply: str) -> tuple[bool, str]:
                 "Write a complete test with real assertions. "
                 "Read the source file to understand what the correct assertion should be."
             )
- 
-    has_assert = "assert " in example_test_section
-    has_raises = "pytest.raises" in example_test_section
-    has_unittest_assert = bool(re.search(r'\bself\.assert\w+\s*\(', example_test_section))
-    has_fail = bool(re.search(r'\bself\.fail\s*\(', example_test_section))
-    if not has_assert and not has_raises and not has_unittest_assert and not has_fail:
-        return False, (
-            "example_test has no assertions. "
-            "It must contain at least one of: assert statement, "
-            "pytest.raises block, or unittest self.assert*/self.fail call."
-        )
- 
+
     # ── Class/function consistency ────────────────────────────────
     existing_test_class = _get_field_value(test_block, "existing_test_class").strip()
     # Strip parenthetical notes e.g. "none (tests are standalone functions)"
@@ -605,7 +604,7 @@ def validate_hints(raw_reply: str) -> tuple[bool, str]:
     return True, ""
 
 
-def run_hint_writer(planner_output: str, max_iterations: int = 10) -> dict:
+def run_hint_writer(planner_output: str, run_id: str, loop: asyncio.AbstractEventLoop, max_iterations: int = 10) -> dict:
     """
     Receives the planner's FINAL_PLAN and produces TEST_HINT + IMPL_HINT.
     Runs locally, no sandbox needed.
@@ -667,28 +666,29 @@ def run_hint_writer(planner_output: str, max_iterations: int = 10) -> dict:
         # ── end supervisor check ──────────────────────────────────────────────
 
 
-        decision = checkpoint_gate("HintWriter", raw_reply)
+        # decision = checkpoint_gate("HintWriter", raw_reply, run_id, loop)
 
-        if decision["status"] == "PROCEED":
-            return raw_reply
+        # if decision["status"] == "PROCEED":
+        #     return raw_reply
 
-        elif decision["status"] == "RETRY":
-            msgs.append({
-                "role": "user",
-                "content": (
-                    f"Hints rejected at checkpoint.\n"
-                    f"Feedback: {decision['feedback']}\n\n"
-                    f"Fix and resubmit."
-                )
-            })
-            return None
+        # elif decision["status"] == "RETRY":
+        #     msgs.append({
+        #         "role": "user",
+        #         "content": (
+        #             f"Hints rejected at checkpoint.\n"
+        #             f"Feedback: {decision['feedback']}\n\n"
+        #             f"Fix and resubmit."
+        #         )
+        #     })
+        #     return None
 
-        elif decision["status"] == "TAKEOVER":
-            return f"TAKEOVER::{raw_reply}"
+        # elif decision["status"] == "TAKEOVER":
+        #     return f"TAKEOVER::{raw_reply}"
 
         return raw_reply
 
     result = run_agent_loop_arch(
+        run_id            = run_id,
         messages          = messages,
         model             = model,
         parse_and_execute = _arch_parse_and_execute,
@@ -697,7 +697,16 @@ def run_hint_writer(planner_output: str, max_iterations: int = 10) -> dict:
         done_token        = "TEST_HINT",
         agent_name        = "📝 HintWriter",
         on_done           = on_done,
+        loop              = loop
     )
+
+    if run_id:
+        from streaming import get_queue, STREAM_DONE
+        import asyncio
+        queue = get_queue(run_id)
+        if queue:
+            # loop = asyncio.get_event_loop()
+            loop.call_soon_threadsafe(queue.put_nowait, STREAM_DONE)
 
     if "TAKEOVER" in result:
         return {

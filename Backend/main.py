@@ -16,6 +16,8 @@ from contextlib import asynccontextmanager
 from db.database import Base, engine
 from api.runs import router as runs_router
 from db.database import Base, engine
+from streaming import set_event_loop
+
 
 
 @asynccontextmanager
@@ -27,6 +29,8 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     print("✓ Database tables ready")
+
+    set_event_loop(asyncio.get_event_loop())
     yield
     # Teardown (Phase 3 will close Redis connections here too)
     await engine.dispose()

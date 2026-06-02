@@ -337,42 +337,37 @@ done
 # Then pass `my_sandbox` into your Developer Agent's tool calls!
 
 
-def checkpoint_gate(agent_name, agent_output):
+import asyncio
+from turn_events import wait_for_grant
+# from llm_utils import _set_status_sync   # wherever you put _set_status_sync
+from db.models import RunStatus
+from db.db_utils import _set_status_sync
+
+def checkpoint_gate(agent_name: str, agent_output: str, run_id: str, loop: asyncio.AbstractEventLoop) -> dict:
     """
-    Pauses the pipeline to request human approval before proceeding.
+    Pauses the pipeline at a checkpoint and waits for the HTTP layer to respond.
+    Writes AWAITING_MORE_TURNS status synchronously (safe from agent thread),
+    then blocks on the turn_events registry until /continue is called.
     """
     print(f"\n{'='*50}")
     print(f"🛑 CHECKPOINT: {agent_name.upper()} TASK COMPLETE")
     print(f"{'='*50}")
-    
-    # Placeholder: Currently prints raw output. Later, pass this through your Summarizer.
     print("\n--- AGENT OUTPUT ---")
     print(agent_output.strip())
     print("--------------------\n")
-    
-    while True:
-        print("What would you like to do?")
-        print("  [y] Approve and proceed to the next step")
-        print("  [n] Reject and provide feedback for a retry")
-        print("  [t] Takeover (Halt automation / Launch Co-Pilot later)")
-        
-        choice = input("Enter your choice (y/n/t): ").strip().lower()
-        
-        if choice == 'y':
-            print(f"✅ Approved. Proceeding past {agent_name}...")
-            return {"status": "PROCEED", "feedback": None}
-            
-        elif choice == 'n':
-            print(f"❌ Rejected. Please provide feedback for the {agent_name} to fix:")
-            feedback = input("Feedback: ").strip()
-            return {"status": "RETRY", "feedback": feedback}
-            
-        elif choice == 't':
-            print("⚠️ Taking over. Halting autonomous pipeline...")
-            return {"status": "TAKEOVER", "feedback": None}
-            
-        else:
-            print("Invalid choice. Please enter 'y', 'n', or 't'.")
+
+    _set_status_sync(run_id, RunStatus.AWAITING_MORE_TURNS, loop)
+    grant = wait_for_grant(run_id, timeout=3600.0)
+
+    if grant is None:
+        return {"status": "TAKEOVER", "feedback": None}
+
+    if grant.extra_turns == 0 and grant.feedback is None:
+        return {"status": "PROCEED", "feedback": None}
+    elif grant.feedback:
+        return {"status": "RETRY", "feedback": grant.feedback}
+    else:
+        return {"status": "PROCEED", "feedback": None}
 
 
 def extract_final_plan(text):

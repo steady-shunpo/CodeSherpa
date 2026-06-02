@@ -1,10 +1,10 @@
 import { useState } from 'react';
+import { Zap, ArrowRight } from 'lucide-react';
 import { useApp } from '../store/appStore';
-import { ArrowRight, Zap } from 'lucide-react';
+import { createRun } from '../utils/api';
 
 const EXAMPLES = [
-  'github.com/facebook/react/issues/12345',
-  'github.com/vercel/next.js/issues/48291',
+  'https://github.com/psf/black/issues/4430',   // keep your real examples here
 ];
 
 export default function IdleScreen() {
@@ -23,26 +23,8 @@ export default function IdleScreen() {
     dispatch({ type: 'START_LOADING', url: trimmed });
 
     try {
-      const res = await fetch(
-        `http://localhost:8000/build-workspace?issue_url=${encodeURIComponent(trimmed)}`
-      );
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.detail || 'Server error');
-      }
-      const data = await res.json();
-      dispatch({
-        type: 'LOADING_DONE',
-        issue: {
-          owner: data.owner,
-          repo: data.repo,
-          number: trimmed.match(/issues\/(\d+)/)[1],
-          title: data.title,
-          body: data.body,
-          labels: [],
-          state: 'open',
-        },
-      });
+      const data = await createRun(trimmed);
+      dispatch({ type: 'SET_RUN_ID', runId: data.run_id });
     } catch (e) {
       dispatch({ type: 'LOADING_ERROR', message: e.message });
     }

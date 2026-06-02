@@ -1,62 +1,114 @@
-export function parseGithubUrl(url) {
-  const m = url.trim().match(/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)/);
-  if (!m) return null;
-  return { owner: m[1], repo: m[2], number: m[3] };
-}
+import { useEffect, useRef } from 'react';
+import { useApp } from '../store/appStore';
 
-export async function fetchIssue(url) {
-  const parsed = parseGithubUrl(url);
-  if (!parsed) throw new Error('Invalid GitHub issue URL');
-  // Real: fetch(`https://api.github.com/repos/${parsed.owner}/${parsed.repo}/issues/${parsed.number}`)
-  await sleep(2400);
-  return {
-    ...parsed,
-    title: `NullPointerException in ${parsed.repo} #${parsed.number}`,
-    body: 'a missing null check on session tokens when AuthFilter is bypassed in test environments',
-    labels: ['bug', 'high-priority'],
-    state: 'open',
-  };
-}
 
-const AGENT_SCRIPTS = {
-  reader: [
-    'Fetching issue metadata and comments...',
-    'Identified issue type: **NullPointerException**',
-    'Affected component: `UserController.java:148`',
-    'Trigger condition: session token is `null` when AuthFilter is bypassed',
-    'Linked PRs: none. Related issues: #441, #389',
-    'Extracted **3 relevant files** from issue body and comments.',
-  ],
-  scanner: [
-    'Cloning repo index...',
-    'Tracing call chain: `AuthFilter → SessionManager → UserService → UserController`',
-    'Found unguarded token access at `SessionManager.java:92`',
-    'Found secondary risk at `UserService.java:204` — same pattern',
-    'Root cause: AuthFilter guarantee not enforced in test profile',
-    'Affected paths: **3 files**, 2 critical, 1 low-risk',
-  ],
-  patcher: [
-    'Generating patch for `UserController.java:148`...',
-    '```java\n- User user = session.getUser();\n+ if (session == null) throw new UnauthorizedException();\n+ User user = session.getUser();```',
-    'Applying same guard to `SessionManager.java:92`',
-    'Patch is minimal — **6 lines changed** across 2 files.',
-    'No logic changes outside null-guard additions.',
-  ],
-  reviewer: [
-    'Running patch analysis...',
-    'No regressions detected in happy path.',
-    'Edge case: concurrent session expiry — patch handles correctly.',
-    'Suggested test: `testNullSessionTokenReturns401()`',
-    '**Confidence: high.** Patch is ready to commit.',
-  ],
-};
+export const BASE = 'http://localhost:8000';
 
-export async function* streamAgent(agentId) {
-  const lines = AGENT_SCRIPTS[agentId] || ['Processing...', 'Done.'];
-  for (const line of lines) {
-    await sleep(500 + Math.random() * 500);
-    yield line;
+
+async function request(path, options = {}) {
+  const res = await fetch(`${BASE}${path}`, {
+    headers: { 'Content-Type': 'application/json' },
+    ...options,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail ?? `Request failed: ${res.status}`);
   }
+  return res.json();
+}
+
+// POST /runs — create a new run, returns the full run object
+export function createRun(issueUrl) {
+  return request('/runs', {
+    method: 'POST',
+    body: JSON.stringify({ issue_url: issueUrl }),
+  });
+}
+
+// GET /runs/{id} — current status, stage, retry count
+export function getRun(runId) {
+  return request(`/runs/${runId}`);
+}
+
+// POST /runs/{id}/continue
+export function continueRun(runId, extraTurns = 10, feedback = null) {
+  return request(`/runs/${runId}/continue`, {
+    method: 'POST',
+    body: JSON.stringify({
+      extra_turns: extraTurns,
+      ...(feedback ? { feedback } : {}),
+    }),
+  });
+}
+
+// GET /runs/{id}/doc — the full assembled doc (all checkpoint outputs merged)
+export function getDoc(runId) {
+  return request(`/runs/${runId}/doc`);
+}
+
+// POST /runs/{id}/messages — send a chat message during intervention
+export function sendMessage(runId, content) {
+  return request(`/runs/${runId}/messages`, {
+    method: 'POST',
+    body: JSON.stringify({ content }),
+  });
+}
+
+// GET /runs/{id}/messages — fetch chat history, optionally filtered by stage
+export function getMessages(runId, stage = null) {
+  const qs = stage ? `?stage=${stage}` : '';
+  return request(`/runs/${runId}/messages${qs}`);
+}
+
+// POST /runs/{id}/resume — release the pause, optionally rewind to a stage
+export function resumeRun(runId, fromStage = null, contextSummary = null, extraTurns = null) {
+  return request(`/runs/${runId}/resume`, {
+    method: 'POST',
+    body: JSON.stringify({
+      ...(fromStage ? { from_stage: fromStage } : {}),
+      ...(contextSummary ? { context_summary: contextSummary } : {}),
+      ...(extraTurns ? { extra_turns: extraTurns } : {}),
+    }),
+  });
+}
+
+
+export function useSSEStream(runId, agentIdx) {
+  const { dispatch } = useApp();
+
+  useEffect(() => {
+    if (!runId) return;
+
+    const es = new EventSource(`${BASE}/runs/${runId}/stream`);
+
+    
+    es.addEventListener('token', (e) => {
+      dispatch({ type: 'AGENT_STREAM_CHUNK', chunk: e.data });
+    });
+    
+    es.addEventListener('done', () => {
+      dispatch({ type: 'AGENT_AWAITING',  });
+      es.close();
+    });
+    
+    es.onmessage = (e) => console.log('message:', e.data);
+    es.addEventListener('token', (e) => console.log('token:', e.data));
+    es.addEventListener('done', (e) => console.log('DONE FIRED:', e.data));
+    
+    es.addEventListener('timeout', () => {
+      es.close();
+    });
+
+    return () => {
+      es.close();
+    };
+  }, [runId, agentIdx]);
+}
+
+
+// POST /runs/{id}/cancel
+export function cancelRun(runId) {
+  return request(`/runs/${runId}/cancel`, { method: 'POST' });
 }
 
 export const sleep = ms => new Promise(r => setTimeout(r, ms));

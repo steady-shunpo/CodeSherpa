@@ -14,7 +14,8 @@ import logging
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from fastapi.responses import StreamingResponse 
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,6 +23,8 @@ from db.database import get_db
 from db.models import STAGES, Checkpoint, Run, RunStatus, StageEnum, MessageResponse, SendMessageRequest, Message, MessagesListResponse
 from orchestrator import delete_checkpoints_after, orchestrate, signal_resume, _get_ctx_for_run
 from agents.intervention import handle_user_message, apply_patches_and_write_checkpoint
+from streaming import get_or_create_queue, STREAM_DONE, drop_queue
+
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/runs", tags=["runs"])
@@ -49,9 +52,13 @@ class RunStatusResponse(BaseModel):
 
 
 class ResumeRequest(BaseModel):
-    from_stage: str | None = None      # e.g. "planner" — triggers rewind if provided
-    context_summary: str | None = None # Phase 2: extra context appended to doc
+    from_stage: str | None = None
+    context_summary: str | None = None
+    extra_turns: int | None = None
 
+class ContinueRequest(BaseModel):
+    extra_turns: int = Field(default=10, ge=1, le=100)
+    feedback: str | None = Field(default=None, max_length=4000)
 
 # ---------------------------------------------------------------------------
 # POST /runs — create and launch
@@ -111,6 +118,61 @@ async def get_run(
     )
 
 
+
+@router.post("/{run_id}/continue", status_code=200)
+async def continue_run(
+    run_id: UUID,
+    body: ContinueRequest = ContinueRequest(),
+    session: AsyncSession = Depends(get_db),
+):
+    """
+    Grant more turns to an agent that has reached its iteration limit.
+    Only valid when run status is AWAITING_MORE_TURNS.
+
+    Body fields:
+      extra_turns  — how many more iterations to allow (default 10, max 100)
+      feedback     — optional guidance injected into the agent's message history
+    """
+    result = await session.execute(select(Run).where(Run.id == run_id))
+    run = result.scalar_one_or_none()
+
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if run.status != RunStatus.AWAITING_MORE_TURNS:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Run is not awaiting more turns (current status: {run.status})",
+        )
+
+    # Update turn counters on the row
+    run.turns_remaining = body.extra_turns
+    run.turns_used      = run.turns_used + body.extra_turns   # cumulative
+    run.status          = RunStatus.STAGE_RUNNING             # optimistic — agent will take over
+    await session.commit()
+
+    from turn_events import grant_turns
+    # Wake the blocked thread
+    granted = grant_turns(
+        run_id=str(run_id),
+        extra_turns=body.extra_turns,
+        feedback=body.feedback,
+    )
+
+    if not granted:
+        raise HTTPException(
+            status_code=409,
+            detail="No active agent waiting for turns — run may have already finished or crashed",
+        )
+
+    return {
+        "run_id": str(run_id),
+        "extra_turns_granted": body.extra_turns,
+        "turns_used_total": run.turns_used,
+        "feedback_injected": body.feedback is not None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # GET /runs/{id}/doc — full assembled doc
 # ---------------------------------------------------------------------------
@@ -152,6 +214,29 @@ async def get_run_doc(
     }
 
 
+@router.get("/{run_id}/stream")
+async def stream_run(run_id: str):
+    queue = get_or_create_queue(run_id)
+
+    async def event_generator():
+        try:
+            while True:
+                token = await asyncio.wait_for(queue.get(), timeout=600.0)
+                if token == STREAM_DONE:
+                    yield f"event: done\ndata: \n\n"
+                    break
+                yield f"event: token\ndata: {token}\n\n"
+        except asyncio.TimeoutError:
+            yield f"event: timeout\ndata: \n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # important for nginx
+        }
+    )
 # ---------------------------------------------------------------------------
 # POST /runs/{id}/resume — resume after intervention
 # ---------------------------------------------------------------------------

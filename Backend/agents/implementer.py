@@ -114,9 +114,9 @@ CHANGES_MADE:
 - <file>: <what changed>
 """
 
-
-def run_implementer(architect_plan: str, test_result: dict, env_summary: str,
-                    env: dict, repo_context: str, sandbox, max_iterations: int = 25,
+import asyncio
+def run_implementer(run_id: str, architect_plan: str, test_result: dict, env_summary: str,
+                    env: dict, repo_context: str, sandbox, loop: asyncio.AbstractEventLoop, max_iterations: int = 25,
                     impl_hint: str = "") -> dict:  # ← add impl_hint parameter
     model = "mistralai/mistral-medium-3.5-128b"
     print("\n" + "=" * 50)
@@ -160,29 +160,30 @@ def run_implementer(architect_plan: str, test_result: dict, env_summary: str,
         if not git_diff.strip():
             git_diff = "(No git diff detected — files may not have been saved.)"
 
-        decision = checkpoint_gate("Implementer", git_diff)
+        # decision = checkpoint_gate("Implementer", git_diff, run_id, loop)
 
-        if decision["status"] == "PROCEED":
-            return git_diff
+        # if decision["status"] == "PROCEED":
+        #     return git_diff
 
-        elif decision["status"] == "RETRY":
-            msgs.append({
-                "role": "user",
-                "content": (
-                    f"Your fix was rejected.\nFeedback: {decision['feedback']}\n\n"
-                    f"Review the failing test and fix accordingly.\n"
-                    f"Run {test_command} to verify before declaring done."
-                )
-            })
-            return None
+        # elif decision["status"] == "RETRY":
+        #     msgs.append({
+        #         "role": "user",
+        #         "content": (
+        #             f"Your fix was rejected.\nFeedback: {decision['feedback']}\n\n"
+        #             f"Review the failing test and fix accordingly.\n"
+        #             f"Run {test_command} to verify before declaring done."
+        #         )
+        #     })
+        #     return None
 
-        elif decision["status"] == "TAKEOVER":
-            # explanation = summarize_failure(messages, model, "implementer", True)
-            return f"TAKEOVER"
+        # elif decision["status"] == "TAKEOVER":
+        #     # explanation = summarize_failure(messages, model, "implementer", True)
+        #     return f"TAKEOVER"
 
         return git_diff
 
     result = run_agent_loop(
+        run_id            = run_id,
         messages          = messages,
         model=model,
         parse_and_execute = parse_and_execute,
@@ -192,7 +193,16 @@ def run_implementer(architect_plan: str, test_result: dict, env_summary: str,
         agent_name        = "🔨 Implementer",
         on_done           = on_done,
         env               = env,
+        loop              = loop,
     )
+
+    if run_id:
+        from streaming import get_queue, STREAM_DONE
+        import asyncio
+        queue = get_queue(run_id)
+        if queue:
+            # loop = asyncio.get_event_loop()
+            loop.call_soon_threadsafe(queue.put_nowait, STREAM_DONE)
 
     if "TAKEOVER" in result:
         return {

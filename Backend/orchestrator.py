@@ -23,13 +23,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from db.database import AsyncSessionLocal
 from db.models import STAGES, Checkpoint, Run, RunStatus, StageEnum
 from repograph.repograph import get_or_build_repograph
-
+from agents.intervention import create_opening_diagnosis
 from stages import stage_setup, stage_planner, stage_hint_writer, stage_test_writer, stage_implementer, stage_verifier, sync_ctx_from_doc
 from failure_doc import (
     create_failure_doc, finalize_failure_doc,
     # finalize_success_doc, get_latest_doc
 )
-
+from turn_events import register, deregister
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -106,24 +106,31 @@ def _rebuild_doc_from_checkpoints(base_doc: dict, checkpoints: list[Checkpoint])
     return doc
 
 
-async def _pause_for_intervention(run_id: str, session: AsyncSession, run: Run, stage: str):
+async def _pause_for_intervention(run_id: str, session: AsyncSession, run: Run, stage: str, doc: dict, ctx: dict):
     """
     Mark run as AWAITING_INTERVENTION and wait for resume signal.
     Phase 2 will send chat messages during this pause.
     Phase 1: just waits until POST /runs/{id}/resume is called.
     """
+
+    print("DOC AT PAUSE FOR INTERVENTION: ", doc)
     event = _resume_events.get(run_id)
     if event is None:
         logger.warning(f"[{run_id}] No resume event found — skipping pause")
         return
 
         
-
+    print("SETTING STATUS")
     await _set_status(session, run, RunStatus.AWAITING_INTERVENTION, stage)
+    print("STATUS SET")
+
+    await create_opening_diagnosis(session, run_id, stage, doc, ctx)
+
     logger.info(f"[{run_id}] Paused at {stage} — waiting for resume")
     event.clear()
     await event.wait()
     logger.info(f"[{run_id}] Resumed at {stage}")
+
 
 
 async def _load_checkpoints(session: AsyncSession, run_id: UUID) -> list[Checkpoint]:
@@ -133,6 +140,21 @@ async def _load_checkpoints(session: AsyncSession, run_id: UUID) -> list[Checkpo
         .order_by(Checkpoint.stage_index)
     )
     return result.scalars().all()
+
+
+async def _notify_awaiting_more_turns(run_id: str, loop: asyncio.AbstractEventLoop):
+    """
+    Called via run_coroutine_threadsafe from the agent thread.
+    Updates run status so the frontend knows to show the 'grant more turns' UI.
+    """
+    async with get_session() as session:            # use your session factory
+        result = await session.execute(
+            select(Run).where(Run.id == UUID(run_id))
+        )
+        run = result.scalar_one_or_none()
+        if run:
+            run.status = RunStatus.AWAITING_MORE_TURNS
+            await session.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +191,9 @@ async def orchestrate(run_id: UUID, issue_url: str):
     _resume_events[run_id_str] = asyncio.Event()
     _resume_events[run_id_str].set()  # not paused initially
 
+    register(run_id_str)
+
+
 
     async with AsyncSessionLocal() as session:
         # Load the Run row
@@ -178,6 +203,8 @@ async def orchestrate(run_id: UUID, issue_url: str):
             return
 
         ctx: dict = {}
+        ctx["run_id"] = str(run_id)
+        ctx["loop"] = asyncio.get_event_loop()
 
         try:
             # ------------------------------------------------------------------
@@ -188,6 +215,7 @@ async def orchestrate(run_id: UUID, issue_url: str):
             ingestion = await get_or_build_repograph(issue_url, session)
 
             # Build the base doc from ingestion data
+            # removed graphpkl and tagsjson. put back if required, but remember to exclude at chat history places
             doc = create_failure_doc(ingestion["repo_url"], ingestion["issue_text"])
             doc.update({
                 "issue_text": ingestion["issue_text"],
@@ -195,12 +223,13 @@ async def orchestrate(run_id: UUID, issue_url: str):
                 "repo_name":  ingestion["repo_name"],
                 "repo_url":   ingestion["repo_url"],
                 "commit_sha": ingestion["commit_sha"],
-                "graph_pkl":  ingestion["graph_pkl"],
-                "tags":       ingestion["tags"],
+                # "graph_pkl":  ingestion["graph_pkl"],
+                # "tags":       ingestion["tags"],
             })
 
             # stage_setup spins up sandbox — not checkpointed
             logger.info(f"[{run_id}] Running stage_setup")
+            
             doc, setup_output = await asyncio.to_thread(stage_setup, doc, **ctx)
             if setup_output is None:
                 logger.error(f"[{run_id}] stage_setup failed — marking FAILED")
@@ -208,6 +237,7 @@ async def orchestrate(run_id: UUID, issue_url: str):
                 return
             ctx.update(setup_output)
             _run_contexts[run_id_str] = ctx
+            print("CTX: ", ctx)
 
 
             # ------------------------------------------------------------------
@@ -261,7 +291,7 @@ async def orchestrate(run_id: UUID, issue_url: str):
                 if output is None:
                     # Stage failed — pause for intervention
                     print("INTERVENTION PAUSE")
-                    await _pause_for_intervention(run_id_str, session, run, stage_enum.value)
+                    await _pause_for_intervention(run_id_str, session, run, stage_enum.value, doc, ctx)
 
                     # After resume: check if a rewind was requested
                     # (rewind deletes checkpoints and updates run.current_stage)
@@ -270,8 +300,10 @@ async def orchestrate(run_id: UUID, issue_url: str):
                     sync_ctx_from_doc(doc, ctx)
                     print("SYNC DONE")
 
-                    if run.current_stage in LINEAR_NAMES:
+                    if run.current_stage in LINEAR_NAMES and run.current_stage != stage_enum.value:
                         idx = LINEAR_NAMES.index(run.current_stage)
+                    else:
+                        idx += 1  # patches applied, move on
                     continue
 
 
@@ -283,7 +315,7 @@ async def orchestrate(run_id: UUID, issue_url: str):
 
                 # Pause between stages for intervention (Phase 2 hook)
                 print("PAUSING FOR INTERVENTION AGAIN")
-                await _pause_for_intervention(run_id_str, session, run, stage_enum.value)
+                await _pause_for_intervention(run_id_str, session, run, stage_enum.value, doc, ctx)
                 print("DONE")
                 await session.refresh(run)
                 print("SESSION REF DONE")
@@ -312,7 +344,7 @@ async def orchestrate(run_id: UUID, issue_url: str):
 
                 if output is None:
                     await _set_status(session, run, RunStatus.BLOCKED_ON_HUMAN, StageEnum.IMPLEMENTER.value)
-                    await _pause_for_intervention(run_id_str, session, run, StageEnum.IMPLEMENTER.value)
+                    await _pause_for_intervention(run_id_str, session, run, StageEnum.IMPLEMENTER.value, doc, ctx)
                     await session.refresh(run)
                     sync_ctx_from_doc(doc, ctx)
 
@@ -346,7 +378,7 @@ async def orchestrate(run_id: UUID, issue_url: str):
 
                 if output is None:
                     await _set_status(session, run, RunStatus.BLOCKED_ON_HUMAN, StageEnum.VERIFIER.value)
-                    await _pause_for_intervention(run_id_str, session, run, StageEnum.VERIFIER.value)
+                    await _pause_for_intervention(run_id_str, session, run, StageEnum.VERIFIER.value, doc, ctx)
                     await session.refresh(run)
                     sync_ctx_from_doc(doc, ctx)
 
@@ -398,6 +430,7 @@ async def orchestrate(run_id: UUID, issue_url: str):
         finally:
             _resume_events.pop(run_id_str, None)
             _run_contexts.pop(run_id_str, None)
+            deregister(run_id_str)
 
 
 # ---------------------------------------------------------------------------

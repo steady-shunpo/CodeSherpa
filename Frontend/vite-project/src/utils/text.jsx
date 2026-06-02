@@ -1,6 +1,8 @@
 // Renders **bold**, `code`, and ```code blocks``` in message text
 export function RichText({ text, className = '' }) {
   // Split on code blocks first
+  if (!text) return <span />
+
   const blockParts = text.split(/(```[\s\S]*?```)/g);
   return (
     <span className={className}>
