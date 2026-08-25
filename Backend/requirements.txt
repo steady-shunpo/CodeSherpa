@@ -1,0 +1,37 @@
+# Core Framework & Server
+fastapi[standard]
+uvicorn
+pydantic
+pydantic-settings
+python-dotenv
+httpx
+
+# Authentication & Security
+python-jose[cryptography]
+
+# Database & ORM
+sqlalchemy>=2.0
+asyncpg
+psycopg2-binary
+
+# Sandboxing & Execution
+e2b_code_interpreter
+
+# LLM Providers & Tooling
+openai
+tiktoken==0.7.0
+
+# Code Intelligence, AST & Graph Parsing
+networkx>=3.2.1
+tree-sitter==0.21.3
+tree-sitter-languages==1.10.2
+grep-ast==0.3.2
+libcst==1.4.0
+pygments>=2.18.0
+toml
+pyyaml
+
+# Utilities & Datasets
+tqdm
+datasets
+pytest

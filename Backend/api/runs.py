@@ -18,12 +18,13 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-
+from datetime import datetime
+from failure_doc import finalize_failure_doc
 from db.database import get_db
 from db.models import STAGES, Checkpoint, Run, RunStatus, StageEnum, MessageResponse, SendMessageRequest, Message, MessagesListResponse
-from orchestrator import delete_checkpoints_after, orchestrate, signal_resume, _get_ctx_for_run
+from orchestrator import delete_checkpoints_after, orchestrate, signal_resume, _get_ctx_for_run, signal_cancel, signal_failure_resolved, signal_failure
 from agents.intervention import handle_user_message, apply_patches_and_write_checkpoint
-from streaming import get_or_create_queue, STREAM_DONE, drop_queue
+from streaming import get_or_create_queue, STREAM_DONE, drop_queue, get_or_create_chat_queue
 
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,7 @@ class RunStatusResponse(BaseModel):
     current_stage: str | None
     stage_index: int
     retry_count: int
+    turns_used: int
 
 
 class ResumeRequest(BaseModel):
@@ -60,11 +62,22 @@ class ContinueRequest(BaseModel):
     extra_turns: int = Field(default=10, ge=1, le=100)
     feedback: str | None = Field(default=None, max_length=4000)
 
+class RunSummaryResponse(BaseModel):
+    id: UUID
+    issue_url: str
+    status: RunStatus
+    current_stage: str | None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 # ---------------------------------------------------------------------------
 # POST /runs — create and launch
 # ---------------------------------------------------------------------------
 
-@router.post("", response_model=CreateRunResponse, status_code=201)
+@router.post("", response_model=RunSummaryResponse, status_code=201)
 async def create_run(
     body: CreateRunRequest,
     session: AsyncSession = Depends(get_db),
@@ -88,7 +101,13 @@ async def create_run(
     asyncio.create_task(orchestrate(run.id, body.issue_url))
     logger.info(f"Run {run.id} created and launched")
 
-    return CreateRunResponse(run_id=str(run.id), status=run.status)
+    return RunSummaryResponse(
+        id=run.id,
+        issue_url=run.issue_url,
+        status=run.status,
+        current_stage=run.current_stage,
+        created_at=run.created_at,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +134,7 @@ async def get_run(
         current_stage=run.current_stage,
         stage_index=run.stage_index,
         retry_count=run.retry_count,
+        turns_used=run.turns_used,
     )
 
 
@@ -150,6 +170,8 @@ async def continue_run(
     run.turns_used      = run.turns_used + body.extra_turns   # cumulative
     run.status          = RunStatus.STAGE_RUNNING             # optimistic — agent will take over
     await session.commit()
+    signal_failure_resolved(str(run_id))
+    
 
     from turn_events import grant_turns
     # Wake the blocked thread
@@ -172,6 +194,55 @@ async def continue_run(
         "feedback_injected": body.feedback is not None,
     }
 
+
+@router.post("/{run_id}/cancel")
+async def cancel_run(run_id: str, session: AsyncSession = Depends(get_db)):
+    run = await session.get(Run, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if run.status not in (RunStatus.STAGE_RUNNING,):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run is in '{run.status}' — only STAGE_RUNNING runs can be cancelled"
+        )
+
+    signal_cancel(str(run_id))
+    signal_failure(str(run_id))
+
+    last_cp = await session.execute(
+        select(Checkpoint)
+        .where(Checkpoint.run_id == run_id)
+        .order_by(Checkpoint.created_at.desc())
+        .limit(1)
+    )
+
+    last_checkpoint = last_cp.fetchone()
+
+    # print("LAST CHECK DB: ", last_checkpoint)
+
+    # run.status = RunStatus.PAUSED
+    # run.current_stage = last_checkpoint.stage if last_checkpoint else 'planner'
+    # print("LAST CHECKPOINT: ", last_checkpoint.stage if last_checkpoint else None)
+    # run.stage_index = last_checkpoint.stage_index if last_checkpoint else 0
+    # print("LAST STAGE INDEX: ", last_checkpoint.stage_index if last_checkpoint else 0)
+    # await session.commit()
+    print("RUN STATUS AT END OF CANCEL ENDPOINT: ", run.status)
+
+    return {
+        "run_id": run_id,
+        "status": "paused",
+        "reverted_to_stage": run.current_stage,
+    }
+
+
+@router.get("/", response_model=list[RunSummaryResponse])
+async def list_runs(session: AsyncSession = Depends(get_db)):
+    result = await session.execute(
+        select(Run).order_by(Run.created_at.desc())
+    )
+    runs = result.scalars().all()
+    return runs
 
 # ---------------------------------------------------------------------------
 # GET /runs/{id}/doc — full assembled doc
@@ -204,7 +275,7 @@ async def get_run_doc(
     doc: dict = {}
     for cp in checkpoints:
         doc.update(cp.output_json)
-
+    print(doc)
     return {
         "run_id": str(run_id),
         "status": run.status,
@@ -237,6 +308,29 @@ async def stream_run(run_id: str):
             "X-Accel-Buffering": "no",  # important for nginx
         }
     )
+
+
+@router.get("/{run_id}/chat/stream")
+async def stream_chat(run_id: str):
+    queue = get_or_create_chat_queue(run_id)
+
+    async def event_generator():
+        try:
+            while True:
+                token = await asyncio.wait_for(queue.get(), timeout=600.0)
+                if token == STREAM_DONE:
+                    yield f"event: done\ndata: \n\n"
+                    break
+                yield f"event: token\ndata: {token}\n\n"
+        except asyncio.TimeoutError:
+            yield f"event: timeout\ndata: \n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
+
 # ---------------------------------------------------------------------------
 # POST /runs/{id}/resume — resume after intervention
 # ---------------------------------------------------------------------------
@@ -308,6 +402,7 @@ async def resume_run(
     )
     # ── Fire the resume signal ────────────────────────────────────────
     signal_resume(str(run_id))
+    signal_failure_resolved(str(run_id))
 
     return {
         "run_id": str(run_id),
@@ -321,7 +416,7 @@ async def resume_run(
 # messages
 # ---------------------------------------------------------------------------
 
-@router.post("/{run_id}/messages", response_model=MessageResponse, status_code=201)
+@router.post("/{run_id}/messages", status_code=202)
 async def send_message(
     run_id: UUID,
     body: SendMessageRequest,
@@ -331,37 +426,14 @@ async def send_message(
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    if run.status != RunStatus.AWAITING_INTERVENTION:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Run is not awaiting intervention (status={run.status}).",
-        )
+    ctx = _get_ctx_for_run(str(run_id))
+    stage = run.current_stage
 
-    # ctx must be retrieved from the live orchestrator task
-    # for now pass empty ctx — tool calls need sandbox which lives in orchestrator
-    ctx = _get_ctx_for_run(str(run_id))  # see note below
-
-    reply = await handle_user_message(
-        session, run_id, run.current_stage, body.content, ctx
+    asyncio.create_task(
+        handle_user_message(str(run_id), stage, body.content, ctx)
     )
 
-    # Fetch the persisted assistant message to return full model
-    result = await session.execute(
-        select(Message)
-        .where(Message.run_id == run_id, Message.role == "assistant")
-        .order_by(Message.created_at.desc())
-        .limit(1)
-    )
-    assistant_msg = result.scalar_one()
-
-    return MessageResponse(
-        id=str(assistant_msg.id),
-        run_id=str(run_id),
-        stage=assistant_msg.stage,
-        role="assistant",
-        content=reply,
-        created_at=assistant_msg.created_at,
-    )
+    return {"status": "streaming"}
 
 
 # routes/runs.py — add

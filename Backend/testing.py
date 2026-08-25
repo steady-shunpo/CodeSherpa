@@ -1,8 +1,8 @@
 import re
-from tools import search_repo_advanced, read_local_file
+# from tools import search_repo_advanced, read_local_file
 import os
-from google import genai
-from google.genai import types
+# from google import genai
+# from google.genai import types
 from dotenv import load_dotenv
 from e2b_code_interpreter import Sandbox
 
@@ -46,10 +46,35 @@ sandbox = Sandbox.create()
 # sandbox.commands.run("mkdir workspace")
 # sandbox.commands.run("cd workspace")
 # sandbox.commands.run("mkdir hello")
-result = sandbox.commands.run("git clone https://github.com/psf/requests.git repo/test") 
-result=sandbox.commands.run("cd repo/test && pip install -e .[tests]")
+result = sandbox.commands.run("git clone https://github.com/psf/black.git repo/test") 
+# 1. Define your commands in the exact order of priority
+install_commands = [
+    ("1", 'cd repo/test && pip install -e ".[dev]"'),
+    ("2", 'cd repo/test && pip install -r requirements-dev.txt'),
+    ("3", 'cd repo/test && pip install -r requirements-test.txt'),
+    ("4", 'cd repo/test && pip install -r requirements.txt')
+]
+
+# 2. Iterate through them
+for label, cmd in install_commands:
+    try:
+        # Attempt to run the command
+        result = sandbox.commands.run(cmd)
+        
+        # If it succeeds, print the result and STOP the loop
+        print(f"{label} Succeeded:", result)
+        break 
+        
+    except Exception as e:
+        # If it fails (throws an exception), catch it and continue to the next one
+        print(f"{label} Failed, trying the next option. (Error: {e})")
+else:
+    # Optional: The 'else' block on a for-loop only runs if the loop 
+    # completes WITHOUT hitting a 'break' (meaning all 4 commands failed).
+    print("All installation attempts failed.")
 # result=sandbox.commands.run("pwd")
 
 # result = sandbox.commands.run("cd requests && pip install -e .[tests]")
+sandbox.kill()
 
-print(result)
+# print(result)

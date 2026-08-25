@@ -6,6 +6,7 @@ export const STATUS_TO_PHASE = {
   stage_running:          'pipeline',
   awaiting_intervention:  'pipeline',
   awaiting_more_turns:    'pipeline',
+  paused:                 'pipeline',
   blocked_on_human:       'blocked',
   succeeded:              'done',
   failed:                 'error',
@@ -22,8 +23,17 @@ export const STAGE_TO_IDX = {
   verifier:        4,
 };
 
+export const AGENT_TO_OUTPUT = {
+  'planner': "architect_plan",
+  'hint_writer': "test_hint",
+  'test_writer': "test_result",
+  'implementer': "",
+}
+
 // Given a backend run object, returns the derived frontend state
 export function deriveRunState(run) {
+  console.log("RUN STATUS: ")
+  console.log(run.status)
   return {
     phase:            STATUS_TO_PHASE[run.status] ?? 'idle',
     currentAgentIdx:  STAGE_TO_IDX[run.current_stage] ?? -1,

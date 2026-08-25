@@ -23,12 +23,16 @@ import subprocess
 from pathlib import Path
 import requests
 import re
+from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from repograph.ast_builder import ASTIndexBuilder
+from db.database import SessionLocal
+
 
 from db.models import Repograph
-from repograph.construct_graph import build_and_save_repograph
+# from repograph.construct_graph import build_and_save_repograph
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +106,7 @@ def get_issue(url):
         f"\nISSUE DESCRIPTION:\n{issue.get('body')}",
     ]
     
-    if formatted_comments:
+    if formatted_comments and False:
         parts.append("\nDISCUSSION COMMENTS:")
         total_comment_chars = 0
 
@@ -131,9 +135,15 @@ def simple_clone(git_url: str, target_dir: str = "testRepos"):
     return 'testRepos'
 
 
-def build_repograph(repo_path: str):
-    graph_path, tags_path =build_and_save_repograph(repo_path)
-    return graph_path, tags_path
+def build_repograph(repo_path: str, repograph_id):
+    with SessionLocal() as session:
+        ASTIndexBuilder(repo_path).build(session, repograph_id)
+    
+
+
+    # graph_path = ""
+    # tags_path = ""
+    # return graph_path, tags_path
 
 # ---------------------------------------------------------------------------
 
@@ -265,109 +275,114 @@ async def get_or_build_repograph(
     if cached is not None:
         logger.info("Repograph cache hit — skipping build, deleting clone")
         
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-        graph_path = os.path.join(base_dir, "graph.pkl")
-        tags_path  = os.path.join(base_dir, "tags.jsonl")
+        # graph_path = os.path.join(base_dir, "graph.pkl")
+        # tags_path  = os.path.join(base_dir, "tags.jsonl")
                 
-        with open(graph_path, "wb") as f:
-            f.write(cached.graph_pkl)
+        # with open(graph_path, "wb") as f:
+        #     f.write(cached.graph_pkl)
         
-        with open(tags_path, "w", encoding="utf-8") as f:
-            for tag in cached.tags_json:
-                f.write(json.dumps(tag) + "\n")
+        # with open(tags_path, "w", encoding="utf-8") as f:
+        #     for tag in cached.tags_json:
+        #         f.write(json.dumps(tag) + "\n")
         
         return {
+            "repograph_id": cached.id,
             "issue_text": issue_text,
             "owner":      owner,
             "repo_name":  repo_name,
             "repo_url":   repo_url,
             "commit_sha": commit_sha,
-            "graph_pkl":  cached.graph_pkl,
-            "tags":       cached.tags_json,
-            "graph_path": graph_path,
-            "tags_path":  tags_path,
+            # "graph_pkl":  cached.graph_pkl,
+            # "tags":       cached.tags_json,
+            # "graph_path": graph_path,
+            # "tags_path":  tags_path,
             "from_cache": True,
         }
 
     # ------------------------------------------------------------------
     # Step 4 — cache miss: build repograph
     # ------------------------------------------------------------------
-    logger.info("Repograph cache miss — building...")
-    print("REPO PATH: ", repo_path)
-    graph_path, tags_path = await asyncio.to_thread(build_repograph, repo_path)
+    logger.info(f"Repograph cache miss — building AST index...")
+    repograph_row = Repograph(repo_url=repo_url, commit_sha=commit_sha)
+    session.add(repograph_row)
+    await session.commit()
+    await session.refresh(repograph_row)
+    repograph_id = repograph_row.id
+    await asyncio.to_thread(build_repograph, repo_path, repograph_id)
 
     # ------------------------------------------------------------------
     # Step 5 — read files into memory
     # ------------------------------------------------------------------
-    graph_pkl = _read_graph_pkl(graph_path)
-    tags      = _read_tags_jsonl(tags_path)
-    logger.info(f"Repograph built: {len(graph_pkl)} bytes, {len(tags)} tags")
+    # graph_pkl = _read_graph_pkl(graph_path)
+    # tags      = _read_tags_jsonl(tags_path)
+    # logger.info(f"Repograph built: {len(graph_pkl)} bytes, {len(tags)} tags")
+    # graph_pkl = ""
+    # tags = ""
 
     # ------------------------------------------------------------------
     # Step 6 — store in DB
     # ------------------------------------------------------------------
-    repograph_row = Repograph(
-        repo_url=repo_url,
-        commit_sha=commit_sha,
-        graph_pkl=graph_pkl,
-        tags_json=tags,
-    )
-    session.add(repograph_row)
-    await session.commit()
+    # repograph_row = Repograph(
+
+    #     repo_url=repo_url,
+    #     commit_sha=commit_sha,
+    #     # graph_pkl=graph_pkl,
+    #     # tags_json=tags,
+    # )
+    # session.add(repograph_row)
+    # await session.commit()
     logger.info("Repograph stored in DB")
 
     # ------------------------------------------------------------------
     # Step 7 — clean up disk (best-effort)
     # ------------------------------------------------------------------
 
-    stmt = select(Repograph).where(
-        Repograph.repo_url == repo_url,
-        Repograph.commit_sha == commit_sha,
-    )
-    result = await session.execute(stmt)
-    cached = result.scalar_one_or_none()
+    # stmt = select(Repograph).where(
+    #     Repograph.repo_url == repo_url,
+    #     Repograph.commit_sha == commit_sha,
+    # )
+    # result = await session.execute(stmt)
+    # cached = result.scalar_one_or_none()
 
-    if cached is not None:
-        logger.info("Repograph cache hit — skipping build, deleting clone")
+    # if cached is not None:
+    #     logger.info("Repograph cache hit — skipping build, deleting clone")
         
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    #     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-        graph_path = os.path.join(base_dir, "graph.pkl")
-        tags_path  = os.path.join(base_dir, "tags.jsonl")
+    #     graph_path = os.path.join(base_dir, "graph.pkl")
+    #     tags_path  = os.path.join(base_dir, "tags.jsonl")
                 
-        with open(graph_path, "wb") as f:
-            f.write(cached.graph_pkl)
+    #     with open(graph_path, "wb") as f:
+    #         f.write(cached.graph_pkl)
         
-        with open(tags_path, "w", encoding="utf-8") as f:
-            for tag in cached.tags_json:
-                f.write(json.dumps(tag) + "\n")
+    #     with open(tags_path, "w", encoding="utf-8") as f:
+    #         for tag in cached.tags_json:
+    #             f.write(json.dumps(tag) + "\n")
         
-        return {
-            "issue_text": issue_text,
-            "owner":      owner,
-            "repo_name":  repo_name,
-            "repo_url":   repo_url,
-            "commit_sha": commit_sha,
-            "graph_pkl":  cached.graph_pkl,
-            "tags":       cached.tags_json,
-            "graph_path": graph_path,
-            "tags_path":  tags_path,
-            "from_cache": True,
-        }
+    #     return {
+    #         "issue_text": issue_text,
+    #         "owner":      owner,
+    #         "repo_name":  repo_name,
+    #         "repo_url":   repo_url,
+    #         "commit_sha": commit_sha,
+    #         "graph_pkl":  cached.graph_pkl,
+    #         "tags":       cached.tags_json,
+    #         "graph_path": graph_path,
+    #         "tags_path":  tags_path,
+    #         "from_cache": True,
+    #     }
     
 
     # _cleanup(repo_path, graph_path, tags_path)
 
     return {
+            "repograph_id": repograph_id,
             "issue_text": issue_text,
             "owner":      owner,
             "repo_name":  repo_name,
             "repo_url":   repo_url,
             "commit_sha": commit_sha,
-            "graph_pkl":  graph_pkl,
-            "tags":       tags,
-            "graph_path": graph_path,
-            "tags_path":  tags_path,
             "from_cache": False,
         }

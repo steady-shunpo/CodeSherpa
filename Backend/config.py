@@ -2,7 +2,7 @@ import os
 from openai import OpenAI
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
-
+from openrouter import OpenRouter
 
 load_dotenv()
 
@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     # Postgres — full async DSN, e.g.:
     # postgresql+asyncpg://user:password@localhost:5432/issue_resolver
     database_url: str = "postgresql+asyncpg://codesherpa:codesherpa@localhost:5432/codesherpa"
+    sync_database_url : str = "postgresql://codesherpa:codesherpa@localhost:5432/codesherpa"
 
     # Redis — for Phase 2/3, not used yet
     redis_url: str = "redis://localhost:6379"
@@ -31,13 +32,19 @@ settings = Settings()
 
 
 # ── API Client ────────────────────────────────────────────────────────────────
+# client = OpenAI(
+#     api_key=os.environ.get("NVIDIA_API_KEY"),
+#     base_url="https://integrate.api.nvidia.com/v1",
+# )
 client = OpenAI(
-    api_key=os.environ.get("NVIDIA_API_KEY"),
-    base_url="https://integrate.api.nvidia.com/v1",
+    api_key=os.environ.get("OPENROUTER_ARCH_KEY"),
+    base_url="https://openrouter.ai/api/v1",
 )
 
-# MODEL = "mistralai/devstral-2-123b-instruct-2512"
-MODEL = "mistralai/mistral-medium-3.5-128b"
+
+# MODEL = "mistralai/mistral-medium-3.5-128b"
+# MODEL = "deepseek/deepseek-v4-pro"
+MODEL = "deepseek/deepseek-v4-flash"
 
 # ── Shared prompt snippets ────────────────────────────────────────────────────
 
@@ -47,6 +54,12 @@ THOUGHT: your reasoning
 ACTION: tool_name("arg")
 __END__
 """
+
+JWT_ALGORITHM        = "HS256"
+JWT_EXPIRE_HOURS     = 24
+
+
+AST_INDEX_DB_PATH = "repo_index.sqlite"
 
 # config.py
 DEFAULT_RUNTIME_BINS = {

@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from db.database import Base, engine
 from api.runs import router as runs_router
+from api.auth import router as auth_router
 from db.database import Base, engine
 from streaming import set_event_loop
 
@@ -52,6 +53,7 @@ app = FastAPI(
 )
 
 app.include_router(runs_router)
+app.include_router(auth_router)
 
 
 app.add_middleware(

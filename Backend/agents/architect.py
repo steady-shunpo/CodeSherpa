@@ -1,10 +1,14 @@
 from tools import search_repo_advanced, read_local_file, checkpoint_gate
-from llm_utils import run_agent_loop, call_llm, run_agent_loop_arch, summarize_failure
-from sandbox_utils import parse_and_execute
+from llm_utils import run_agent_loop, call_llm, run_agent_loop_arch, summarize_failure, MODEL
+from sandbox_utils import _arch_parse_and_execute
 from agents.hint_supervisor import run_hint_supervisor
-import re
+from repograph.ast_search import SymbolSearchIndex
+from db.database import SessionLocal
+from tools import format_symbol_result
+import re 
 import subprocess
 import os
+import uuid
 
 PLANNER_SYSTEM_PROMPT = """
 Role: Senior AI Software Engineer
@@ -13,11 +17,14 @@ Objective: Analyze a GitHub issue, find the root cause in the codebase,
 and produce a precise implementation plan.
 
 TOOLS (plain text only — no JSON):
-1. search_repo("term")           — Ego-graph of a function, class, or variable.
-                                   Use ONLY the name. No keywords before it.
-2. read_file("path", start, end) — Read source code. end can be -1 for end of file.
-3. search_file("path", "term")   — Search for a term in a specific file.
+1. search_repo("symbol_name")    — Find where a function, class, or method is defined in the codebase.
+                                   Returns file path, exact line numbers, signature, and docstring.
+                                   Use ONLY the symbol name (e.g. "RequestsCookieJar", "parse_header").
+2. read_file("path", start, end) — Read source code lines. end can be -1 to read through the end of the file.
+3. search_file("path", "term")   — Search for a term/string in a specific file (grep).
                                    Returns matching lines with line numbers.
+4. line_count("path")            — Get total line count for a file before reading.
+5. list_symbols("path")          — List all symbols (functions, classes, methods) defined in a specific file.
 
 RULES:
 - ONE tool call per turn. Output __END__ and stop immediately.
@@ -29,14 +36,14 @@ RULES:
 - Each response = exactly one THOUGHT + one ACTION + __END__. Nothing more.
 
 READING STRATEGY:
-- Read wide ranges (50-100 lines) rather than multiple narrow reads
-- Do not read the same section twice
-- search_repo first to find the file, then read_file to see the code
-- Once you have enough context, output FINAL_PLAN immediately
+- search_repo first to find the file and line range of relevant functions/classes.
+- Use read_file to inspect the code around target lines. Read wide ranges (50-100 lines) rather than multiple narrow reads.
+- Do not read the same section twice.
+- Once you have enough context, output FINAL_PLAN immediately.
 
 FORMAT 1 — Gathering context:
 THOUGHT: <reasoning>
-ACTION: search_repo("Name") or read_file("path/file.py", 10, 50) or search_file("path", "term")
+ACTION: search_repo("Name") or read_file("path/file.py", 10, 50) or search_file("path", "term") or list_symbols("path/file.py")
 __END__
 
 FORMAT 2 — Final output (when you are confident about the fix):
@@ -56,92 +63,14 @@ CHANGE:
 
 Repeat FILE/LOCATION/LINES/ANCHOR/CHANGE block for each change needed.
 """
-# Architect uses local files, not a sandbox
-ARCH_TOOL_PATTERNS = {
-    "search":        re.compile(r'(?:ACTION:\s*)?search_repo\(\s*"([^"]+)"\s*\)'),
-    "read":          re.compile(r'(?:ACTION:\s*)?read_file\(\s*"([^"]+)"\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\)'),
-    "search_file":   re.compile(r'(?:ACTION:\s*)?search_file\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\)'),
-    "read_no_lines": re.compile(r'(?:ACTION:\s*)?read_file\(\s*"([^"]+)"\s*\)\s*(?:$|\n|__END__)'),
-    "line_count":    re.compile(r'(?:ACTION:\s*)?line_count\(\s*"([^"]+)"\s*\)'),
-}
-SAFE_COMMANDS = ("grep", "find", "cat", "head", "tail", "wc", "ls", "sed")
 
-def _arch_parse_and_execute(agent_reply: str, _sandbox) -> tuple[str, str]:
-    """Architect uses local tools only — no sandbox, no shell writes."""
-    agent_reply = re.sub(r'```\w*\n(.*?)```', r'\1', agent_reply, flags=re.DOTALL)
-    agent_reply = agent_reply.strip()
-
-    if m := ARCH_TOOL_PATTERNS["search"].search(agent_reply):
-        term = m.group(1)
-        print(f"🔍 search_repo: {term}")
-        return "search_repo", search_repo_advanced(term)
-
-    if m := ARCH_TOOL_PATTERNS["read"].search(agent_reply):
-        fp, start, end = m.group(1), int(m.group(2)), int(m.group(3))
-        if end == -1:
-            end = 99999
-        print(f"📖 read_file: {fp} lines {start}-{end}")
-        return "read_file", read_local_file(fp, start, end)
-
-    if m := ARCH_TOOL_PATTERNS["search_file"].search(agent_reply):
-        fp, term = m.group(1), m.group(2)
-        print(f"🔎 search_file: {fp} for '{term}'")
-        try:
-            filepath = os.path.join("testRepos", fp)
-            results = []
-            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                for i, line in enumerate(f, start=1):
-                    if term in line:
-                        results.append(f"{i}:{line.rstrip()}")
-            return "search_file", "\n".join(results) if results else "(no matches found)"
-        except FileNotFoundError:
-            return "search_file", f"ERROR: File not found: {fp}"
-        except Exception as e:
-            return "search_file", f"ERROR: {e}"
-
-    if m := ARCH_TOOL_PATTERNS["line_count"].search(agent_reply):
-        fp = m.group(1)
-        print(f"📏 line_count: {fp}")
-        try:
-            filepath = os.path.join("testRepos", fp)
-            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                count = sum(1 for _ in f)
-            return "line_count", (
-                f"{fp} has {count} lines.\n"
-                f"To read the whole file: read_file(\"{fp}\", 1, {count})\n"
-                f"To read first 50 lines: read_file(\"{fp}\", 1, 50)"
-            )
-        except FileNotFoundError:
-            return "line_count", f"ERROR: File not found: {fp}"
-        except Exception as e:
-            return "line_count", f"ERROR: {e}"
-
-    if "run_bash_command" in agent_reply:
-        return "none", (
-            "ERROR: run_bash_command is not available to the Architect.\n"
-            "Use search_file(\"path\", \"term\") to search within a specific file.\n"
-            "Use search_repo(\"term\") to find where a function or class is defined.\n"
-            "Use read_file(\"path\", start, end) to read a file at known line numbers."
-        )
-
-    if m := ARCH_TOOL_PATTERNS["read_no_lines"].search(agent_reply):
-        fp = m.group(1)
-        return "read_file", (
-            f"ERROR: read_file requires line numbers.\n"
-            f"You called: read_file(\"{fp}\")\n"
-            f"Correct usage:\n"
-            f"  read_file(\"{fp}\", 1, 50)     — read first 50 lines\n"
-            f"  read_file(\"{fp}\", 1, -1)     — read entire file\n"
-            f"Tip: use line_count(\"{fp}\") first to see how many lines the file has."
-        )
-
-    return "none", ""
 
 
 import asyncio
-def run_planner(user_issue: str, run_id: str, loop: asyncio.AbstractEventLoop, max_iterations: int = 25) -> dict:
+import threading
+def run_planner(user_issue: str, run_id: str, repograph_id: uuid.UUID, loop: asyncio.AbstractEventLoop, cancel_flag: threading.Event, max_iterations: int = 8, feedback: str | None = None) -> dict:
     # model = "nvidia/nemotron-3-super-120b-a12b"
-    model = "mistralai/mistral-medium-3.5-128b"
+    model = MODEL
     # model  = 'mistralai/devstral-2-123b-instruct-2512'
     # model  = 'deepseek-ai/deepseek-v4-pro'
     print("\n" + "=" * 50)
@@ -152,6 +81,12 @@ def run_planner(user_issue: str, run_id: str, loop: asyncio.AbstractEventLoop, m
         {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
         {"role": "user",   "content": f"Here is the issue to analyze:\n\n{user_issue}"},
     ]
+
+    if feedback:
+        messages.append({
+            "role": "user",
+            "content": f"⚠️ [SUPERVISOR FEEDBACK FROM PREVIOUS ATTEMPT]:\n{feedback}\n\nPlease take this feedback into account and produce an updated FINAL_PLAN."
+        })
 
     def on_done(raw_reply: str, msgs: list):
         print("\n✅ Planner has a plan!")
@@ -174,7 +109,9 @@ def run_planner(user_issue: str, run_id: str, loop: asyncio.AbstractEventLoop, m
         #     return f"TAKEOVER::{raw_reply}"
 
         return raw_reply
-
+    print("******************************************************************")
+    print(messages)
+    print("******************************************************************")
     result = run_agent_loop_arch(
         run_id            = run_id,
         messages          = messages,
@@ -185,7 +122,9 @@ def run_planner(user_issue: str, run_id: str, loop: asyncio.AbstractEventLoop, m
         done_token        = ("FINAL_PLAN" or "FINAL PLAN" or "final plan" or "Final Plan" or "Final plan" or "Final_plan"),
         agent_name        = "🧠 Planner",
         on_done           = on_done,
+        repograph_id      = repograph_id,
         loop              = loop,
+        cancel_flag       = cancel_flag,
     )
 
     if run_id:
@@ -223,81 +162,90 @@ HINT_WRITER_SYSTEM_PROMPT = """
 You will receive a FINAL_PLAN from a planner agent that describes a bug fix.
 Your ONLY job is to produce TEST_HINT and IMPL_HINT for downstream agents.
 
-You do NOT need to understand the bug deeply.
-You do NOT need to verify the fix.
-You only need to READ specific files to extract exact information.
+You do NOT need to understand the bug deeply or verify the fix.
+You only need to inspect the codebase to confirm the anchor line and extract real imports/test structure.
+Aim to complete this task in 3 to 4 turns total.
 
 TOOLS (plain text only — no JSON):
-0. line_count("path")
-   ACTION: line_count("exampleFile.py")
+1. read_file("path", start, end) — Read source code lines. end can be -1 for end of file.
+   ACTION: read_file("tests/test_foo.py", 1, 50)
    __END__
 
-1. read_file("path", start, end) — Read source code. end can be -1 for end of file.
-   ACTION: read_file("exampleTestFile.py", 1, 50)
+2. search_file("path", "term")   — Search for a string/keyword inside a SINGLE known file.
+   ACTION: search_file("tests/test_format.py", "def test_")
    __END__
 
-2. search_file("path", "term")   — Search for a term in a specific file.
-                                   Returns matching lines with line numbers.
-   ACTION: search_file("tests/test_foo.py", "def test_")
+3. find_files("pattern")          — Find files matching a glob pattern or keyword anywhere in the repo.
+   ACTION: find_files("test_*.py")
+   ACTION: find_files("*type_ignore*")
    __END__
 
-3. search_repo("term")           — Ego-graph of a function, class, or variable.
-                                   Use ONLY the name. No keywords before it.
-   ACTION: search_repo("ExampleFunction")
+4. search_repo("symbol_name")    — Lookup a function or class definition in the codebase AST index.
+   ACTION: search_repo("split_line")
+   CRITICAL: Pass ONLY the bare identifier (e.g. "split_line", "RequestsCookieJar").
+   NEVER include "def ", "class ", "()", comments, strings, or file paths in search_repo.
+
+5. list_symbols("path")          — List all symbol definitions (functions, classes) in a file.
+   ACTION: list_symbols("tests/test_foo.py")
    __END__
 
-RULES:
+6. list_dir("dir_path")           — List files and subdirectories in a folder.
+   ACTION: list_dir("tests")
+   __END__
+
+7. line_count("path")            — Get total line count for a file.
+   ACTION: line_count("src/foo.py")
+   __END__
+
+RULES & CONSTRAINTS:
 - ONE tool call per turn. Output __END__ and stop immediately.
-- Maximum 4 reads total. Use the budget wisely.
 - No JSON. Plain text only.
-- Each response = exactly one THOUGHT + one ACTION + __END__. Nothing more.
+- Each turn response = exactly one THOUGHT + one ACTION + __END__. Nothing more.
 - Do NOT generate tool responses yourself. Wait for the user to provide them.
-- Do NOT explore beyond what you need for the hints.
+- Do NOT explore endlessly. You only need a representative test file for imports and test style.
 - Do NOT re-derive the fix. Trust the planner's plan.
 
-READING STRATEGY:
-Read in this exact order — do not deviate:
-1. search_file on the test file for an existing similar test class/method
-2. read_file on the test file at the line range from step 1
-3. read_file on the source file at the ANCHOR line from the plan to confirm it exists
-4. read_file on models file ONLY if the test needs real model names
+RECOMMENDED 3-TO-4 TURN WORKFLOW:
+1. Turn 1 (Confirm Anchor): Use read_file on the source file from the plan around the anchor line to confirm it exists (so anchor_confirmed can be 'yes').
+2. Turn 2 (Locate Test File): If test file is not in the plan, use find_files("test_*.py") or list_dir("tests") to find relevant test files.
+3. Turn 3 (Inspect Test File): Use read_file(test_file, 1, 50) or search_file(test_file, "def test_") to grab real imports and test setup.
+   (Note: If tests are parameterized or use test-data cases, cite the test runner file or test module as existing_test_example).
+4. Turn 4 (Output Hints): Output TEST_HINT and IMPL_HINT immediately.
 
 ═══════════════════════════════════════════════════
 FILLING IN THE HINT FIELDS — rules per field:
 ═══════════════════════════════════════════════════
 
 relevant_imports:
-  Copy the FULL import block from the top of the existing test file.
-  Then append any additional imports the new test will need that are NOT
-  already in that block (e.g. the specific module being tested, specific models).
-  The test writer will use this verbatim — it must be complete and correct.
-  Never guess. Only include lines you have read directly from a file.
+  Include ONLY the imports that your example_test actually uses.
+  Do NOT include unused imports or guess sub-module paths.
+  Only include import statements you have directly confirmed from reading the codebase.
 
 models_available:
   This field tells the test writer what objects to use in test setup.
   - If the test needs database models: list exact model names, their fields,
     and how they are instantiated (e.g. "Article(author=..., headline=...)")
-  - If the test needs no database models (e.g. pure function call, no ORM):
+  - If the test needs no database models (e.g. pure function call, string formatting, AST manipulation):
     write exactly: "none required — test needs no database objects"
-  - Never write just "none required" without the explanation. The test writer
-    must know WHY so it does not go searching for models that don't exist.
+  - Never write just "none required" without the explanation.
 
 example_test:
   Read the existing test file first, then copy and adapt a real test from it.
   - Start from an actual test function you have read — do not write from memory.
   - Use real class names, real field names, real import paths from what you read.
   - Never use placeholders like MyModel, SomeObject, expected_value.
-  - The test must call the trigger and assert correct behavior (not assertRaises).
+  - The test must call the trigger and assert correct behavior.
   - Must start with `def test_` and be runnable as-is.
+
 ═══════════════════════════════════════════════════
-OUTPUT FORMAT (use exactly):
+OUTPUT FORMAT (when ready to output hints):
 ═══════════════════════════════════════════════════
-THOUGHT: I have everything I need to write the hints.
+THOUGHT: I have confirmed the anchor line and gathered test imports.
 TEST_HINT:
-- test_style: <unittest|pytest — confirmed from reading the test file>
+- test_style: <pytest | unittest>
 - test_file_location: <exact path to test file>
 - existing_test_example: <exact path AND line range e.g. tests/foo.py lines 45-70>
-- existing_test_class: <exact class name confirmed from reading>
+- existing_test_class: <exact class name confirmed from reading, or none>
 - relevant_imports: <complete import block — see rules above>
 - models_available: <see rules above — never just "none required">
 - test_setup: <exact setup e.g. "use cls.example_inc from setUpTestData" or "none">
@@ -309,7 +257,7 @@ IMPL_HINT:
 - file: <exact file path from the plan>
 - location: <function/method name>
 - anchor_line: <exact line of code immediately before insertion point>
-- anchor_confirmed: <yes/no — did you read the file and confirm this line exists>
+- anchor_confirmed: yes
 - exact_code: <complete code to insert, copied exactly from the plan>
 - verify_command: <exact test command to run after implementing>
 
@@ -320,11 +268,10 @@ multiple locations, describe both in a single IMPL_HINT block with comments:
 
 MANDATORY CHECKS BEFORE OUTPUTTING:
 1. existing_test_example MUST have line numbers — 'tests/foo.py' alone is rejected
-2. example_test MUST use real names — never MyModel, SomeModel, or placeholders
-3. relevant_imports MUST include everything the new test file needs, not just
-   what the existing test file imports
-4. anchor_confirmed MUST be 'yes' — you must have read the source file to verify
-5. models_available MUST include the explanation, not just "none required"
+2. anchor_confirmed MUST be 'yes' (confirm by reading the source file first)
+3. example_test MUST use real names — never MyModel, SomeModel, or placeholders
+4. relevant_imports MUST include everything the new test file needs
+5. models_available MUST include the explanation, not just 'none required'
 """
 
 
@@ -501,8 +448,8 @@ def validate_hints(raw_reply: str) -> tuple[bool, str]:
     masked_test = _mask_code_blocks(test_block)
     masked_impl = _mask_code_blocks(impl_block)
  
-    missing_test = [f for f in TEST_HINT_REQUIRED if f not in masked_test]
-    missing_impl = [f for f in IMPL_HINT_REQUIRED if f not in masked_impl]
+    missing_test = [f for f in TEST_HINT_REQUIRED if f not in masked_test and f != "test_style:"]
+    missing_impl = [f for f in IMPL_HINT_REQUIRED if f not in masked_impl and f != "anchor_confirmed:"]
     missing = missing_test + missing_impl
     if missing:
         return False, f"Missing fields: {', '.join(missing)}"
@@ -604,13 +551,13 @@ def validate_hints(raw_reply: str) -> tuple[bool, str]:
     return True, ""
 
 
-def run_hint_writer(planner_output: str, run_id: str, loop: asyncio.AbstractEventLoop, max_iterations: int = 10) -> dict:
+def run_hint_writer(planner_output: str, run_id: str, repograph_id, loop: asyncio.AbstractEventLoop, cancel_flag: threading.Event, max_iterations: int = 7, feedback: str | None = None) -> dict:
     """
     Receives the planner's FINAL_PLAN and produces TEST_HINT + IMPL_HINT.
     Runs locally, no sandbox needed.
     """
     # model = "mistralai/devstral-2-123b-instruct-2512"  # smaller model — this is a lookup task
-    model = "mistralai/mistral-medium-3.5-128b"  # smaller model — this is a lookup task
+    model = MODEL  # smaller model — this is a lookup task
     print("\n" + "=" * 50)
     print("📝 STARTING HINT WRITER")
     print("=" * 50)
@@ -631,6 +578,12 @@ def run_hint_writer(planner_output: str, run_id: str, loop: asyncio.AbstractEven
             )
         }
     ]
+
+    if feedback:
+        messages.append({
+            "role": "user",
+            "content": f"⚠️ [SUPERVISOR FEEDBACK FROM PREVIOUS ATTEMPT]:\n{feedback}\n\nPlease take this feedback into account and produce updated TEST_HINT and IMPL_HINT."
+        })
 
     def on_done(raw_reply: str, msgs: list):
         print("\n✅ Hint writer produced hints.")
@@ -653,6 +606,7 @@ def run_hint_writer(planner_output: str, run_id: str, loop: asyncio.AbstractEven
         should_proceed, supervisor_feedback = run_hint_supervisor(
             hint_text=raw_reply,
             messages_ref=msgs,
+            repograph_id=repograph_id
         )
         if not should_proceed:
             msgs.append({
@@ -697,7 +651,9 @@ def run_hint_writer(planner_output: str, run_id: str, loop: asyncio.AbstractEven
         done_token        = "TEST_HINT",
         agent_name        = "📝 HintWriter",
         on_done           = on_done,
-        loop              = loop
+        repograph_id      = repograph_id,
+        loop              = loop,
+        cancel_flag       = cancel_flag,
     )
 
     if run_id:

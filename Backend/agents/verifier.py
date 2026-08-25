@@ -27,9 +27,10 @@ Output ONLY this JSON:
 }
 """
 
+import threading
 import asyncio
 def run_verifier(run_id: str, git_diff: str, test_result: dict, architect_plan: str,
-                 env: dict, loop: asyncio.AbstractEventLoop, sandbox) -> dict:
+                 env: dict, loop: asyncio.AbstractEventLoop, cancel_flag: threading.Event, sandbox) -> dict:
     print("\n" + "=" * 50)
     print("✅ STARTING VERIFIER")
     print("=" * 50)
@@ -69,6 +70,8 @@ def run_verifier(run_id: str, git_diff: str, test_result: dict, architect_plan: 
 
     raw = ""
     for chunk in call_llm(messages, model="mistralai/devstral-2-123b-instruct-2512", temperature=0.0, timeout=30):
+        if cancel_flag.is_set():
+            break
         raw += chunk
         publish_token(run_id, chunk, loop)
     raw = re.sub(r"```json|```", "", raw).strip()

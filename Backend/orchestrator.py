@@ -16,6 +16,7 @@ Call from outside:
 import asyncio
 import logging
 from uuid import UUID
+import threading
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,8 +24,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from db.database import AsyncSessionLocal
 from db.models import STAGES, Checkpoint, Run, RunStatus, StageEnum
 from repograph.repograph import get_or_build_repograph
-from agents.intervention import create_opening_diagnosis
+from agents.intervention import create_opening_diagnosis, run_autonomous_intervention
 from stages import stage_setup, stage_planner, stage_hint_writer, stage_test_writer, stage_implementer, stage_verifier, sync_ctx_from_doc
+from turn_events import wait_for_grant
 from failure_doc import (
     create_failure_doc, finalize_failure_doc,
     # finalize_success_doc, get_latest_doc
@@ -65,6 +67,8 @@ MAX_PIPELINE_RETRIES = 2  # or import from config
 # One asyncio.Event per run — used to pause between stages for intervention
 # Keyed by run_id (str). Populated on run creation, cleaned up on termination.
 _resume_events: dict[str, asyncio.Event] = {}
+_run_cancel_flags: dict[str, threading.Event] = {}
+_run_failure_flags: dict[str, threading.Event] = {}
 _run_contexts: dict[str, dict] = {}
 
 # ---------------------------------------------------------------------------
@@ -82,6 +86,7 @@ async def _set_status(session: AsyncSession, run: Run, status: RunStatus, stage:
 async def _write_checkpoint(session: AsyncSession, run: Run, stage: StageEnum, output: dict):
     """Append a checkpoint row for a completed stage."""
     stage_index = STAGES.index(stage)
+    print("WRITING CP WITH DOC: ", output)
     checkpoint = Checkpoint(
         run_id=run.id,
         stage=stage.value,
@@ -92,6 +97,13 @@ async def _write_checkpoint(session: AsyncSession, run: Run, stage: StageEnum, o
     # Also update run's stage_index to reflect progress
     run.stage_index = stage_index
     await session.commit()
+    result = await session.execute(
+        select(Checkpoint)
+        .where(Checkpoint.run_id == run.id)
+        .order_by(Checkpoint.stage_index)
+    )
+    checkpoints = result.scalars().all()
+    print("CP CHECK AT WRITE: ", checkpoints[0].output_json)
     logger.info(f"[{run.id}] Checkpoint saved: {stage.value}")
 
 
@@ -113,23 +125,91 @@ async def _pause_for_intervention(run_id: str, session: AsyncSession, run: Run, 
     Phase 1: just waits until POST /runs/{id}/resume is called.
     """
 
-    print("DOC AT PAUSE FOR INTERVENTION: ", doc)
+    # print("DOC AT PAUSE FOR INTERVENTION: ", doc)
     event = _resume_events.get(run_id)
     if event is None:
         logger.warning(f"[{run_id}] No resume event found — skipping pause")
         return
 
         
-    print("SETTING STATUS")
-    await _set_status(session, run, RunStatus.AWAITING_INTERVENTION, stage)
-    print("STATUS SET")
+    # print("SETTING STATUS")
+    # await _set_status(session, run, RunStatus.AWAITING_INTERVENTION, stage)
+    # print("STATUS SET")
+
+    print("RUN STATUS AT PAUSE START: ", run.status)
 
     await create_opening_diagnosis(session, run_id, stage, doc, ctx)
+
+    print("RUN STATUS AT PAUSE 2: ", run.status)
+
+    # if run.status == RunStatus.PAUSED:
+    #     print("COMES FROM CANCEL")
+    #     await _set_status(session, run, RunStatus.AWAITING_MORE_TURNS)
+
+
+    # else:
+    #     print("DID NOT COME FROM CANCEL")
+    await _set_status(session, run, RunStatus.AWAITING_INTERVENTION)
 
     logger.info(f"[{run_id}] Paused at {stage} — waiting for resume")
     event.clear()
     await event.wait()
     logger.info(f"[{run_id}] Resumed at {stage}")
+
+
+MAX_AUTONOMOUS_RETRIES_PER_STAGE = 1
+
+
+async def _handle_stage_failure(
+    run_id_str: str,
+    session: AsyncSession,
+    run: Run,
+    stage_name: str,
+    doc: dict,
+    ctx: dict,
+) -> str:
+    """
+    Handles a stage failure by first attempting autonomous intervention if retry budget allows.
+    Returns:
+      "retry_with_feedback" - autonomous instruction received, retry stage
+      "retry_with_patch"    - autonomous patch applied, retry stage
+      "resumed"             - paused for human intervention and resumed
+    """
+    auto_retry_key = f"{stage_name}_auto_retries"
+    auto_retries = ctx.get(auto_retry_key, 0)
+
+    if auto_retries < MAX_AUTONOMOUS_RETRIES_PER_STAGE:
+        ctx[auto_retry_key] = auto_retries + 1
+        logger.info(f"[{run_id_str}] Running autonomous intervention for {stage_name} (attempt {ctx[auto_retry_key]}/{MAX_AUTONOMOUS_RETRIES_PER_STAGE})")
+        decision = await run_autonomous_intervention(session, run_id_str, stage_name, doc, ctx)
+
+        if decision["decision"] == "INSTRUCTION" and decision.get("instruction"):
+            logger.info(f"[{run_id_str}] Autonomous instruction generated for {stage_name}")
+            ctx["feedback"] = decision["instruction"]
+            _reset_sandbox(ctx)
+            return "retry_with_feedback"
+
+        elif decision["decision"] == "PATCH" and decision.get("patches"):
+            logger.info(f"[{run_id_str}] Autonomous patch generated for {stage_name}: {list(decision['patches'].keys())}")
+            doc.update(decision["patches"])
+            cp = Checkpoint(
+                run_id=run.id,
+                stage=f"intervention_{stage_name}",
+                stage_index=run.stage_index,
+                output_json=decision["patches"],
+            )
+            session.add(cp)
+            await session.commit()
+            sync_ctx_from_doc(doc, ctx)
+            _reset_sandbox(ctx)
+            return "retry_with_patch"
+
+        else:
+            logger.info(f"[{run_id_str}] Autonomous intervention chose {decision['decision']} — escalating to human")
+
+    # If budget exhausted or intervention decided to escalate / could not auto-resolve:
+    await _pause_for_intervention(run_id_str, session, run, stage_name, doc, ctx)
+    return "resumed"
 
 
 
@@ -142,20 +222,18 @@ async def _load_checkpoints(session: AsyncSession, run_id: UUID) -> list[Checkpo
     return result.scalars().all()
 
 
-async def _notify_awaiting_more_turns(run_id: str, loop: asyncio.AbstractEventLoop):
-    """
-    Called via run_coroutine_threadsafe from the agent thread.
-    Updates run status so the frontend knows to show the 'grant more turns' UI.
-    """
-    async with get_session() as session:            # use your session factory
-        result = await session.execute(
-            select(Run).where(Run.id == UUID(run_id))
-        )
-        run = result.scalar_one_or_none()
-        if run:
-            run.status = RunStatus.AWAITING_MORE_TURNS
-            await session.commit()
 
+def _get_output_map(run: Run):
+    cur_stage = run.current_stage
+    if cur_stage == 'planner':
+        return 'architect_plan'
+    if cur_stage == 'hint_writer':
+        return 'test_hint'
+    if cur_stage == 'test_writer':
+        return 'test_result'
+    if cur_stage == 'implementer':
+        return 'impl_result'
+    return ''
 
 # ---------------------------------------------------------------------------
 # Delete checkpoints after a given stage_index (used by rewind)
@@ -190,6 +268,8 @@ async def orchestrate(run_id: UUID, issue_url: str):
     run_id_str = str(run_id)
     _resume_events[run_id_str] = asyncio.Event()
     _resume_events[run_id_str].set()  # not paused initially
+    _run_cancel_flags[run_id_str] = threading.Event()
+    _run_failure_flags[run_id_str] = threading.Event()
 
     register(run_id_str)
 
@@ -205,6 +285,8 @@ async def orchestrate(run_id: UUID, issue_url: str):
         ctx: dict = {}
         ctx["run_id"] = str(run_id)
         ctx["loop"] = asyncio.get_event_loop()
+        ctx["cancel_flag"] = _run_cancel_flags[run_id_str]
+        ctx["failure_active"] = _run_failure_flags[run_id_str]
 
         try:
             # ------------------------------------------------------------------
@@ -213,6 +295,7 @@ async def orchestrate(run_id: UUID, issue_url: str):
             await _set_status(session, run, RunStatus.INGESTING)
 
             ingestion = await get_or_build_repograph(issue_url, session)
+            ctx["repograph_id"] = ingestion["repograph_id"]
 
             # Build the base doc from ingestion data
             # removed graphpkl and tagsjson. put back if required, but remember to exclude at chat history places
@@ -223,9 +306,12 @@ async def orchestrate(run_id: UUID, issue_url: str):
                 "repo_name":  ingestion["repo_name"],
                 "repo_url":   ingestion["repo_url"],
                 "commit_sha": ingestion["commit_sha"],
+                "repograph_id": ingestion["repograph_id"]
                 # "graph_pkl":  ingestion["graph_pkl"],
                 # "tags":       ingestion["tags"],
             })
+
+
 
             # stage_setup spins up sandbox — not checkpointed
             logger.info(f"[{run_id}] Running stage_setup")
@@ -236,8 +322,12 @@ async def orchestrate(run_id: UUID, issue_url: str):
                 await _set_status(session, run, RunStatus.FAILED)
                 return
             ctx.update(setup_output)
+
+            logger.info("Setup done" )
+            print("Setup done" )
             _run_contexts[run_id_str] = ctx
-            print("CTX: ", ctx)
+
+            # print("CTX: ", ctx.get("repo_context"))
 
 
             # ------------------------------------------------------------------
@@ -258,12 +348,14 @@ async def orchestrate(run_id: UUID, issue_url: str):
                 start_index = last_stage_index + 1
             else:
                 start_index = 0
+                logger.info("Writing setup checkpoint for doc.")
+                await _write_checkpoint(session, run, StageEnum.PLANNER, {'user_issue': doc.get('user_issue')})
 
             # ------------------------------------------------------------------
             # LINEAR STAGES: planner → hint_writer → test_writer
             # ------------------------------------------------------------------
             await _set_status(session, run, RunStatus.STAGE_RUNNING)
-
+            # print("ARCH PLAN: ", ctx.get('architect_plan'))
             LINEAR_STAGES = [
                 (StageEnum.PLANNER,     stage_planner),
                 (StageEnum.HINT_WRITER, stage_hint_writer),
@@ -273,7 +365,9 @@ async def orchestrate(run_id: UUID, issue_url: str):
 
             idx = start_index  # may be > 0 if resuming after crash/rewind
             while idx < len(LINEAR_STAGES):
+                print(idx)
                 stage_enum, stage_fn = LINEAR_STAGES[idx]
+                print(stage_enum)
 
                 # Skip stages already checkpointed (crash recovery)
                 already_done = any(cp.stage == stage_enum.value for cp in existing_checkpoints)
@@ -287,13 +381,17 @@ async def orchestrate(run_id: UUID, issue_url: str):
 
                 doc, output = await asyncio.to_thread(stage_fn, doc, **ctx)
                 print("OUTPUT: ", output)
+                await session.refresh(run)
 
-                if output is None:
-                    # Stage failed — pause for intervention
-                    print("INTERVENTION PAUSE")
-                    await _pause_for_intervention(run_id_str, session, run, stage_enum.value, doc, ctx)
+                if output is None or output.get(_get_output_map(run)) == '':
+                    # Stage failed — attempt autonomous intervention or pause
+                    print("INTERVENTION TRIGGERED")
+                    print("RUN STATUS 0: ", run.status)
+                    action = await _handle_stage_failure(run_id_str, session, run, stage_enum.value, doc, ctx)
+                    if action in ("retry_with_feedback", "retry_with_patch"):
+                        continue
 
-                    # After resume: check if a rewind was requested
+                    # After human resume: check if a rewind was requested
                     # (rewind deletes checkpoints and updates run.current_stage)
                     await session.refresh(run)
                     print("SYNCING CTX")
@@ -306,7 +404,7 @@ async def orchestrate(run_id: UUID, issue_url: str):
                         idx += 1  # patches applied, move on
                     continue
 
-
+                ctx.pop("feedback", None)  # clear feedback on successful stage completion
                 print("CTX UPDATE")
                 ctx.update(output)
                 print("UPDATE DONE")
@@ -315,6 +413,7 @@ async def orchestrate(run_id: UUID, issue_url: str):
 
                 # Pause between stages for intervention (Phase 2 hook)
                 print("PAUSING FOR INTERVENTION AGAIN")
+                # await _set_status(session, run, RunStatus.AWAITING_INTERVENTION, stage_enum.value)
                 await _pause_for_intervention(run_id_str, session, run, stage_enum.value, doc, ctx)
                 print("DONE")
                 await session.refresh(run)
@@ -343,8 +442,10 @@ async def orchestrate(run_id: UUID, issue_url: str):
                 doc, output = await asyncio.to_thread(stage_implementer, doc, attempt=attempt, **ctx)
 
                 if output is None:
-                    await _set_status(session, run, RunStatus.BLOCKED_ON_HUMAN, StageEnum.IMPLEMENTER.value)
-                    await _pause_for_intervention(run_id_str, session, run, StageEnum.IMPLEMENTER.value, doc, ctx)
+                    action = await _handle_stage_failure(run_id_str, session, run, StageEnum.IMPLEMENTER.value, doc, ctx)
+                    if action in ("retry_with_feedback", "retry_with_patch"):
+                        continue
+
                     await session.refresh(run)
                     sync_ctx_from_doc(doc, ctx)
 
@@ -369,6 +470,7 @@ async def orchestrate(run_id: UUID, issue_url: str):
                     _reset_sandbox(ctx)
                     continue
 
+                ctx.pop("feedback", None)
                 ctx.update(output)
                 await _write_checkpoint(session, run, StageEnum.IMPLEMENTER, output)
 
@@ -377,8 +479,10 @@ async def orchestrate(run_id: UUID, issue_url: str):
                 doc, output = await asyncio.to_thread(stage_verifier, doc, attempt=attempt, **ctx)
 
                 if output is None:
-                    await _set_status(session, run, RunStatus.BLOCKED_ON_HUMAN, StageEnum.VERIFIER.value)
-                    await _pause_for_intervention(run_id_str, session, run, StageEnum.VERIFIER.value, doc, ctx)
+                    action = await _handle_stage_failure(run_id_str, session, run, StageEnum.VERIFIER.value, doc, ctx)
+                    if action in ("retry_with_feedback", "retry_with_patch"):
+                        continue
+
                     await session.refresh(run)
                     sync_ctx_from_doc(doc, ctx)
 
@@ -400,9 +504,13 @@ async def orchestrate(run_id: UUID, issue_url: str):
 
                 if output.get("passed"):
                     logger.info(f"[{run_id}] ✓ Pipeline complete")
-                    final_doc = finalize_success_doc(
+                    from agents.intervention import output_final_message
+                    #CHANGE
+                    await output_final_message(
                         doc,
+                        run_id,
                         ctx["impl_result"]["git_diff"],
+                        ctx['loop'],
                         output["verdict"],
                     )
                     await _write_checkpoint(session, run, StageEnum.VERIFIER, output)
@@ -474,6 +582,34 @@ def signal_resume(run_id: str):
         logger.warning(f"[{run_id}] signal_resume called but no event found")
 
 
+# ---------------------------------------------------------------------------
+# Cancem — called by POST /runs/{id}/cancel 
+# ---------------------------------------------------------------------------
+
+def signal_cancel(run_id: str):
+    flag = _run_cancel_flags.get(run_id)
+    if flag:
+        flag.set()
+        logger.info(f"[{run_id}] Cancel signal sent")
+    else:
+        logger.warning(f"[{run_id}] signal_cancel called but no flag found")
+
+
+def signal_failure(run_id: str):
+    flag = _run_failure_flags.get(run_id)
+    if flag:
+        flag.set()
+        logger.info(f"[{run_id}] Failure signal sent")
+    else:
+        logger.warning(f"[{run_id}] signal_failure called but no flag found")
+
+def signal_failure_resolved(run_id: str):
+    flag = _run_failure_flags.get(run_id)
+    if flag:
+        flag.clear()
+        logger.info(f"[{run_id}] Failure flag cleared")
+    else:
+        logger.warning(f"[{run_id}] signal_failure_resolved called but no flag found")
 
 # ---------------------------------------------------------------------------
 # Helper for intervention ctx

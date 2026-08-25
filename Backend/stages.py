@@ -8,19 +8,21 @@ from agents.verifier     import run_verifier
 from llm_utils import extract_test_hint
 # from discussion import run_discussion_loop
 from tools import get_issue, format_issue_for_pipeline, simple_clone
-from repograph.construct_graph import build_and_save_repograph
+# from repograph.construct_graph import build_and_save_repograph
 from failure_doc import (
     create_failure_doc, finalize_failure_doc,
     # finalize_success_doc, get_latest_doc
 )
 import asyncio
-
+import threading
 
 # Your existing sandbox setup function
 from tools import setup_developer_environment
 
 MAX_PIPELINE_RETRIES = 2  # how many times to retry the full impl+verify loop
 
+# MODEL = "mistralai/mistral-medium-3.5-128b"
+MODEL = "deepseek/deepseek-v4-pro"
 
 
 
@@ -32,9 +34,9 @@ MAX_PIPELINE_RETRIES = 2  # how many times to retry the full impl+verify loop
 #  STAGE FUNCTIONS
 # ═══════════════════════════════════════════════════════════
 
-def stage_planner(doc: dict, run_id: str, loop: asyncio.AbstractEventLoop, **_) -> tuple[dict, dict | None]:
+def stage_planner(doc: dict, run_id: str, loop: asyncio.AbstractEventLoop, cancel_flag: threading.Event, feedback: str | None = None, **_) -> tuple[dict, dict | None]:
     doc["stage"] = "planner"
-    result = run_planner(doc["user_issue"], run_id, loop)
+    result = run_planner(doc["user_issue"], run_id, doc["repograph_id"], loop, cancel_flag, feedback=feedback)
 
     doc["architect_plan"] = result.get("content", "")
 
@@ -46,7 +48,7 @@ def stage_planner(doc: dict, run_id: str, loop: asyncio.AbstractEventLoop, **_) 
             stage          = "planner",
             failure_reason = result.get("reason", "max_iterations"),
             messages       = result.get("messages", []),
-            model          = "mistralai/mistral-medium-3.5-128b",
+            model          = MODEL,
         ), None
 
     doc["architect_plan"] = result["content"]
@@ -54,9 +56,9 @@ def stage_planner(doc: dict, run_id: str, loop: asyncio.AbstractEventLoop, **_) 
     return doc, {"architect_plan": result["content"]}
 
 
-def stage_hint_writer(doc: dict, run_id: str, architect_plan: str, loop: asyncio.AbstractEventLoop, **_) -> tuple[dict, dict | None]:
+def stage_hint_writer(doc: dict, run_id: str, architect_plan: str, loop: asyncio.AbstractEventLoop, cancel_flag: threading.Event, feedback: str | None = None, **_) -> tuple[dict, dict | None]:
     doc["stage"] = "hint_writer"
-    result = run_hint_writer(architect_plan, run_id, loop)
+    result = run_hint_writer(architect_plan, run_id, doc["repograph_id"], loop, cancel_flag, feedback=feedback)
 
     test_hint, impl_hint = "", ""
     doc['test_hint'] = result.get("content", "")
@@ -71,7 +73,7 @@ def stage_hint_writer(doc: dict, run_id: str, architect_plan: str, loop: asyncio
             stage          = "hint_writer",
             failure_reason = result.get("reason", "max_iterations"),
             messages       = result.get("messages", []),
-            model          = "mistralai/mistral-medium-3.5-128b",
+            model          = MODEL,
         ), None
 
     content = result["content"]
@@ -92,14 +94,17 @@ def stage_setup(doc: dict, architect_plan: str | None = None, **_) -> tuple[dict
     print("\n🖥️  Spinning up sandbox...")
     # time.sleep(60)
     print("TEST1")
-    sandbox, pythonpath, pytestflags = setup_developer_environment(doc["repo_url"])
+    sandbox, setup_result = setup_developer_environment(doc["repo_url"])
 
     print("\n🔍 Probing environment...")
     # env_summary, env = probe_environment(sandbox)
     env_summary = ""
     env =  {}
-    env["pythonpath"]   = pythonpath
-    env["pytestflags"]  = pytestflags
+    # env["pythonpath"]   = pythonpath
+    # env["pytestflags"]  = pytestflags
+    env['install_command'] = setup_result['install_command']
+    env["test_command"] = setup_result['test_command']
+
     doc["env_summary"]  = env_summary
     print(env_summary)
 
@@ -120,6 +125,8 @@ def stage_test_writer(
     test_hint: str,
     run_id: str,
     loop: asyncio.AbstractEventLoop,
+    cancel_flag: threading.Event,
+    feedback: str | None = None,
     **_,
 ) -> tuple[dict, dict | None]:
     doc["stage"] = "test_writer"
@@ -130,10 +137,13 @@ def stage_test_writer(
         env_summary    = env_summary,
         env            = env,
         repo_context   = repo_context,
+        repograph_id   = doc["repograph_id"],
         sandbox        = sandbox,
-        max_iterations = 20,
+        max_iterations = 8,
         test_hint      = test_hint,
         loop           = loop,
+        cancel_flag    = cancel_flag,
+        feedback       = feedback,
     )
 
     doc["test_result"] = {
@@ -154,11 +164,19 @@ def stage_test_writer(
             stage          = "test_writer",
             failure_reason = result.get("reason", "max_iterations"),
             messages       = result.get("messages", []),
-            model          = "mistralai/mistral-medium-3.5-128b",
+            model          = MODEL,
             # sandbox        = sandbox,
         ), None
 
     print(f"\n🧪 Failing test ready: {result.get('test_file', 'unknown')}")
+    test_file = result.get("test_file", "")
+    if test_file and sandbox:
+        clean_tf = test_file.split()[0]
+        try:
+            sandbox.commands.run(f"cd workspace/repo && git config user.name 'CodeSherpa' && git config user.email 'sherpa@codesherpa.ai' && git add {clean_tf} && git commit -m 'add reproducer test'")
+        except Exception as e:
+            print(f"⚠️ Could not commit test file to git: {e}")
+
     doc["test_result"] = {
         "test_file":    result.get("test_file", ""),
         "test_command": result.get("test_command", ""),
@@ -179,6 +197,8 @@ def stage_implementer(
     attempt: int,
     run_id: str,
     loop: asyncio.AbstractEventLoop,
+    cancel_flag: threading.Event,
+    feedback: str | None = None,
     **_,
 ) -> tuple[dict, dict | None]:
     doc["stage"] = "implementer"
@@ -189,10 +209,13 @@ def stage_implementer(
         env_summary    = env_summary,
         env            = env,
         repo_context   = repo_context,
+        repograph_id   = doc["repograph_id"],
         sandbox        = sandbox,
-        max_iterations = 25,
+        max_iterations = 12,
         impl_hint      = impl_hint,
         loop           = loop,
+        cancel_flag    = cancel_flag,
+        feedback       = feedback,
     )
     doc["partial_diff"] = result.get("git_diff", "")
 
@@ -205,7 +228,7 @@ def stage_implementer(
                 stage          = "implementer",
                 failure_reason = result.get("reason", "max_iterations"),
                 messages       = result.get("messages", []),
-                model          = "mistralai/devstral-2-123b-instruct-2512",
+                model          = MODEL,
                 # sandbox        = sandbox,
             ), None
         print("🔄 Resetting git state for retry...")
@@ -226,6 +249,7 @@ def stage_verifier(
     attempt: int,
     run_id: str,
     loop: asyncio.AbstractEventLoop,
+    cancel_flag: threading.Event,
     **_,
 ) -> tuple[dict, dict | None]:
     doc["stage"] = "verifier"
@@ -237,6 +261,7 @@ def stage_verifier(
         env            = env,
         sandbox        = sandbox,
         loop           = loop,
+        cancel_flag    = cancel_flag,
     )
     doc["verifier_verdict"] = verdict
 
@@ -252,18 +277,24 @@ def stage_verifier(
         return doc, {"retry": True}
 
     print("🛑 Max retries reached.")
+    doc["failure_summary"] = (
+        f"Verifier failed.\nSummary: {verdict.get('summary', '')}\n"
+        f"Target Test: {verdict.get('target_test', '')}\n"
+        f"Full Suite: {verdict.get('full_suite', '')}\n"
+        f"Issues: {verdict.get('issues', [])}"
+    )
     return finalize_failure_doc(
         doc            = doc,
         stage          = "verifier",
         failure_reason = "verifier_failed",
         messages       = [],
-        model          = "mistralai/devstral-2-123b-instruct-2512",
+        model          = MODEL,
         # sandbox        = sandbox,
     ), None
 
 
 def sync_ctx_from_doc(doc: dict, ctx: dict) -> None:
     """Keep ctx in sync with whatever is already saved in doc."""
-    for key in ["architect_plan", "test_hint", "impl_hint", "test_result", "partial_diff", "env_summary"]:
+    for key in ["architect_plan", "test_hint", "impl_hint", "test_result", "partial_diff", "env_summary", "feedback"]:
         if doc.get(key):
             ctx[key] = doc[key]

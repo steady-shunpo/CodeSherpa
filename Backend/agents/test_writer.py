@@ -1,6 +1,7 @@
 from tools import checkpoint_gate, setup_developer_environment
-from llm_utils import run_agent_loop, summarize_failure
+from llm_utils import run_agent_loop, summarize_failure, MODEL
 from sandbox_utils import parse_and_execute
+import re
 # TEST_WRITER_SYSTEM_PROMPT = """
 # Role: Software Test Engineer
 
@@ -198,20 +199,58 @@ The TEST_HINT is the source of truth.
   verify_command      → use this exact command every single run, never modify it
 
 ═══════════════════════════════════════════════════
-AVAILABLE TOOLS (ONLY ONE TOOL CALL PER TURN, make sure to use parentheses when calling the tool.):
+AVAILABLE TOOLS (ONLY ONE TOOL CALL PER TURN, plain text only — no JSON):
 ═══════════════════════════════════════════════════
 
-1. read_file("<file_path>", <start_line>, <end_line>)
+1. read_file("file_path", start_line, end_line)
+   ACTION: read_file("tests/test_foo.py", 1, 50)
    __END__
 
-2. write_file("<file_path>")
-   |||
-   <complete file content>
-   |||
+2. search_file("path", "term")
+   Search for a term or pattern in a specific file.
+   ACTION: search_file("tests/test_foo.py", "def test_")
    __END__
 
-3. run_bash_command("<cmd>")
+3. search_repo("symbol_name")
+   Find where a function, class, or model is defined in the codebase.
+   Returns file path, exact line numbers, signature, and docstring.
+   ACTION: search_repo("Article")
    __END__
+
+4. list_symbols("file_path")
+   List all symbols (functions, classes, methods) defined inside a specific file.
+   ACTION: list_symbols("tests/test_foo.py")
+   __END__
+
+5. line_count("file_path")
+   Get total line count of a file.
+   ACTION: line_count("tests/test_foo.py")
+   __END__
+
+6. write_file("file_path")
+   ACTION: write_file("tests/test_<bug_name>_reproducer.py")
+   |||
+   complete file content
+   |||
+   __END__
+# IMPORTANT: Make sure to properly follow this format. Otherwise file WILL NOT BE written.
+
+7. run_bash_command("cmd")
+   ACTION: run_bash_command("<cmd>")
+   __END__
+
+
+═══════════════════════════════════════════════════
+RESPONSE FORMAT (plain text only — NO JSON, NO XML):
+═══════════════════════════════════════════════════
+Every turn MUST have exactly one THOUGHT line and one ACTION line ending with __END__:
+
+THOUGHT: I will read the test file to verify test structure.
+ACTION: read_file("tests/test_foo.py", 1, 50)
+__END__
+
+CRITICAL: Do NOT use XML/HTML tags like <tool_call>, <tool_name>, or <tool>.
+Do NOT format tools as JSON. Use plain text ACTION: ... __END__.
 
 
 ═══════════════════════════════════════════════════
@@ -236,11 +275,23 @@ PHASE 3 — RUN AND FIX
   Run using verify_command immediately after writing.
 
   A) Traceback in repo's own source files → SUCCESS. Declare FINAL_RESULT.
-  B) ImportError or ModuleNotFoundError → your run command is wrong. Re-read verify_command and use it exactly.
+  B) ImportError or ModuleNotFoundError → Remove unused or invalid imports from your test file. Only keep what the test actually calls. Write the cleaned versioned file and run again.
   C) SyntaxError or AttributeError in your test file → fix in new versioned file, run again.
   D) Traceback in framework internals or stdlib → setup error. Re-read existing_test_class and models_available. Fix, new file, run again.
   E) Test passes cleanly → you are not hitting the bug. Re-read trigger and models_available word for word. Revise, run again.
   F) AssertionError from your own assert → adjust assertion to correct post-fix behavior. New file, run again.
+
+═══════════════════════════════════════════════════
+TEST FILE CREATION RULES:
+═══════════════════════════════════════════════════
+- ALWAYS create a NEW standalone test file with write_file:
+    tests/test_<bug_name>_reproducer.py
+- The `test_file_location` from TEST_HINT is only where existing reference tests live in the repo (for imports and setup style). Do NOT attempt to modify or append to existing repo test files.
+- In FINAL_RESULT:
+    TEST_FILE must be the EXACT relative path of the file you created with write_file (e.g. tests/test_<bug_name>_reproducer.py). Do NOT append notes like '(append the test function to this file)'.
+    TEST_COMMAND must run your newly created test file:
+    TEST_COMMAND: pytest tests/test_<bug_name>_reproducer.py -x
+
 
 ═══════════════════════════════════════════════════
 DECLARING DONE:
@@ -251,8 +302,8 @@ that originates in this repo's own source files.
 
 FINAL_RESULT:
 STATUS: SUCCESS
-TEST_FILE: <relative path>
-TEST_COMMAND: <exact command>
+TEST_FILE: tests/test_<bug_name>_reproducer.py
+TEST_COMMAND: pytest tests/test_<bug_name>_reproducer.py -x
 FAILURE_OUTPUT:
 <relevant lines from actual failure>
 
@@ -423,9 +474,10 @@ FAILURE_OUTPUT:
 
 
 import asyncio
+import threading
 def run_test_writer(run_id: str, architect_plan: str, user_issue: str, env_summary: str, env: dict,
-                    repo_context: str, sandbox, test_hint: str, loop: asyncio.AbstractEventLoop, max_iterations: int = 30) -> dict:
-    model = "mistralai/mistral-medium-3.5-128b"
+                    repo_context: str, sandbox, test_hint: str, repograph_id, loop: asyncio.AbstractEventLoop, cancel_flag: threading.Event, max_iterations: int = 8, feedback: str | None = None) -> dict:
+    model = MODEL
     print("\n" + "=" * 50)
     print("🧪 STARTING TEST WRITER")
     print("=" * 50)
@@ -438,8 +490,8 @@ def run_test_writer(run_id: str, architect_plan: str, user_issue: str, env_summa
     hint_section = (
         f"TEST_HINT (read this first — it tells you exactly what to write):\n"
         f"{test_hint}\n\n"
-        f"""IMPORTANT: Use this EXACT format when running test cases. Otherwise tests WILL fail.
-            ```PYTHONPATH={env['pythonpath']} python -m pytest test_file_name -x --tb=short {env['pytestflags']}```
+        f"""IMPORTANT: Use this EXACT command when running test cases. Otherwise tests WILL fail.
+            ```{env['test_command']}```
         """
     ) if test_hint else (
         f"No TEST_HINT available. Explore the test structure yourself.\n"
@@ -474,27 +526,51 @@ def run_test_writer(run_id: str, architect_plan: str, user_issue: str, env_summa
         }
     ]
 
+    if feedback:
+        messages.append({
+            "role": "user",
+            "content": f"⚠️ [SUPERVISOR FEEDBACK FROM PREVIOUS ATTEMPT]:\n{feedback}\n\nPlease apply this feedback and write a reproducing test."
+        })
+
     def on_done(raw_reply: str, msgs: list):
         print("\n✅ Test Writer reports a failing test.")
-        # decision = checkpoint_gate("TestWriter", raw_reply, run_id, loop)
+        test_file = _extract_field(raw_reply, "TEST_FILE:")
+        test_command = _extract_field(raw_reply, "TEST_COMMAND:")
 
-        # if decision["status"] == "PROCEED":
-        #     result_holder["result"] = raw_reply
-        #     return raw_reply
+        if not test_file or not test_command:
+            msgs.append({
+                "role": "user",
+                "content": (
+                    "⚠️ [TEST VALIDATION FAILED]:\n"
+                    "Your FINAL_RESULT is missing required fields.\n"
+                    "Ensure you format your completion exactly as:\n"
+                    "FINAL_RESULT:\n"
+                    "STATUS: SUCCESS\n"
+                    "TEST_FILE: tests/test_<bug_name>_reproducer.py\n"
+                    "TEST_COMMAND: pytest tests/test_<bug_name>_reproducer.py -x\n"
+                    "FAILURE_OUTPUT:\n<relevant failure lines>\n"
+                )
+            })
+            return None
 
-        # elif decision["status"] == "RETRY":
-        #     msgs.append({
-        #         "role": "user",
-        #         "content": (
-        #             f"Your test was rejected.\nFeedback: {decision['feedback']}\n\n"
-        #             "Fix the test and confirm it fails before trying again."
-        #         )
-        #     })
-        #     return None
+        # Clean any trailing comments from test_file
+        clean_file = re.sub(r'\(.*?\)', '', test_file).strip()
 
-        # elif decision["status"] == "TAKEOVER":
-        #     # explanation = summarize_failure(messages, model, "test_writer", True)
-        #     return "TAKEOVER"
+        # Check if the test file actually exists inside sandbox
+        if sandbox:
+            from tools import run_remote_command
+            check = run_remote_command(sandbox, f"test -f workspace/repo/{clean_file} && echo EXISTS || echo MISSING")
+            if "MISSING" in check:
+                msgs.append({
+                    "role": "user",
+                    "content": (
+                        f"⚠️ [TEST VALIDATION FAILED]:\n"
+                        f"The file '{clean_file}' does not exist on disk in workspace/repo/.\n"
+                        "You must write the complete standalone reproducer test file using write_file() before declaring FINAL_RESULT.\n"
+                        "Do NOT reference existing repo files with '(append ...)' instructions."
+                    )
+                })
+                return None
 
         result_holder["result"] = raw_reply
         return raw_reply
@@ -509,7 +585,9 @@ def run_test_writer(run_id: str, architect_plan: str, user_issue: str, env_summa
         done_token        = ("FINAL_RESULT" or "FINAL RESULT" or "Final Result" or "Final result"),
         agent_name        = "🧪 TestWriter",
         on_done           = on_done,
+        repograph_id      = repograph_id,
         loop              = loop,
+        cancel_flag       = cancel_flag,
         env               = env,
         is_complex        = False
     )
@@ -554,7 +632,10 @@ def run_test_writer(run_id: str, architect_plan: str, user_issue: str, env_summa
 def _extract_field(text: str, field: str) -> str:
     for line in text.splitlines():
         if line.strip().startswith(field):
-            return line.split(field, 1)[-1].strip()
+            val = line.split(field, 1)[-1].strip()
+            if field == "TEST_FILE:":
+                val = re.sub(r'\(.*?\)', '', val).strip()
+            return val
     return ""
 
 

@@ -1,4 +1,5 @@
 import { createContext, useContext, useReducer } from 'react';
+import { AGENT_TO_OUTPUT } from '../utils/statusMap';
 
 export const AGENTS = [
   {
@@ -31,17 +32,12 @@ export const AGENTS = [
 const initialState = {
   runId: null,
   sidebarOpen: true,
-  chatHistory: [
-    { id: 'h1', title: 'NullPointer in UserController', ts: '2h ago' },
-    { id: 'h2', title: 'Race condition on login', ts: 'Yesterday' },
-    { id: 'h3', title: 'Memory leak in EventBus', ts: '3d ago' },
-    { id: 'h4', title: 'Timeout on large payloads', ts: '5d ago' },
-  ],
+  runs: [],
   // 'idle' | 'loading' | 'chat' | 'pipeline'
   phase: 'idle',
   issueUrl: '',
   issue: null,
-  messages: [],
+  chatMessages: [],
   agents: AGENTS.map(a => ({ ...a, status: 'waiting', stream: [], expanded: false })),
   currentAgentIdx: -1,
 };
@@ -52,15 +48,44 @@ function reducer(state, action) {
     case 'TOGGLE_SIDEBAR':
       return { ...state, sidebarOpen: !state.sidebarOpen };
 
+    case 'RUNS_LOADING':
+      return { ...state, runsLoading: true };
+
+    case 'RUNS_LOADED':
+      return { ...state, runs: action.runs, runsLoading: false };
+
+    case 'RUN_CREATED':
+      return {
+        ...state,
+        runs: [action.run, ...state.runs],
+        // don't touch phase — let the poller drive it
+      };
+
+    case 'RUNS_ERROR':
+      return { ...state, runsLoading: false };
+
     case 'START_LOADING':
       return { ...state, phase: 'loading', issueUrl: action.url };
 
     case 'UPDATE_MESSAGE':
       return {
         ...state,
-        messages: state.messages.map(m =>
+        chatMessages: state.chatMessages.map(m =>
           m.id === action.id ? { ...m, content: action.text } : m
         ),
+      };
+
+    case 'LOAD_RUN':
+      // console.log(AGENT_TO_OUTPUT['planner'])
+      // console.log("DOC", action.payload.doc)
+      return {
+        ...state,
+        phase: 'loading',
+        chatMessages: [],
+        agents: AGENTS.map(a => ({ ...a, status: 'waiting', 
+          stream: action.payload.doc[AGENT_TO_OUTPUT[a.id]] ? [action.payload.doc[AGENT_TO_OUTPUT[a.id]]] : [],  
+          expanded: true })),
+        currentAgentIdx: -1,
       };
 
     case 'LOADING_DONE':
@@ -68,8 +93,8 @@ function reducer(state, action) {
         ...state,
         phase: 'chat',
         issue: action.issue,
-        messages: [{
-          id: 'init',
+        chatMessages: [{
+          id: 'init_' + Date.now(),
           role: 'assistant',
           content: '',   // ← empty, stream fills it
           ts: Date.now(),
@@ -77,10 +102,10 @@ function reducer(state, action) {
       };
 
     case 'ADD_MESSAGE':
-      return { ...state, messages: [...state.messages, action.msg] };
+      return { ...state, chatMessages: [...state.chatMessages, action.msg] };
 
     case 'SET_MESSAGES':
-      return { ...state, messages: action.messages };
+      return { ...state, chatMessages: action.messages };
 
     case 'START_PIPELINE':
       return {
@@ -90,6 +115,42 @@ function reducer(state, action) {
         agents: state.agents.map((a, i) => ({
           ...a, status: i === 0 ? 'running' : 'waiting', stream: [], expanded: i === 0,
         })),
+      };
+
+    case 'CHAT_STREAM_START': {
+      // Finalize any existing streaming message first to prevent multi-bubble updates
+      const finalizedMessages = state.chatMessages.map(m =>
+        m.id === 'streaming'
+          ? { ...m, id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7), streaming: false }
+          : m
+      );
+      return {
+        ...state,
+        chatMessages: [
+          ...finalizedMessages,
+          { id: 'streaming', role: 'assistant', content: '', streaming: true }
+        ]
+      };
+    }
+
+    case 'CHAT_STREAM_CHUNK':
+      return {
+        ...state,
+        chatMessages: state.chatMessages.map(m =>
+          m.id === 'streaming'
+            ? { ...m, content: m.content + action.chunk }
+            : m
+        )
+      };
+
+    case 'CHAT_STREAM_DONE':
+      return {
+        ...state,
+        chatMessages: state.chatMessages.map(m =>
+          m.id === 'streaming'
+            ? { ...m, id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7), streaming: false }
+            : m
+        )
       };
 
     case 'AGENT_STREAM_CHUNK': {
@@ -119,9 +180,9 @@ function reducer(state, action) {
         ...state, agents,
         currentAgentIdx: finished ? state.currentAgentIdx : next,
         phase: finished ? 'chat' : 'pipeline',
-        messages: finished
-          ? [...state.messages, { id: 'fin' + Date.now(), role: 'assistant', content: 'Pipeline complete...', ts: Date.now() }]
-          : state.messages,
+        chatMessages: finished
+          ? [...state.chatMessages, { id: 'fin' + Date.now(), role: 'assistant', content: 'Pipeline complete...', ts: Date.now() }]
+          : state.chatMessages,
       };
     }
 
@@ -146,7 +207,7 @@ function reducer(state, action) {
       );
       return {
         ...state, agents, phase: 'chat',
-        messages: [...state.messages, {
+        chatMessages: [...state.chatMessages, {
           id: 'stop' + Date.now(), role: 'assistant',
           content: `Pipeline paused at **${state.agents[state.currentAgentIdx]?.name}**. I have full context of everything found so far — ask me anything or dive into the results above.`,
           ts: Date.now(),
@@ -161,23 +222,29 @@ function reducer(state, action) {
       return { ...state, agents };
     }
 
+    case 'RESET': {
+      return {
+        ...initialState,
+        sidebarOpen: state.sidebarOpen, // preserve sidebar state
+        runs: state.runs,               // preserve loaded runs list
+      };
+    }
+
     case 'SET_RUN_ID':
       return { ...state, runId: action.runId };
+
+
 
     case 'SYNC_RUN': {
       const { run, derived } = action;
       const agentIdx = derived.currentAgentIdx;
 
       const agents = state.agents.map((a, i) => {
-        // Already marked done — don't overwrite
-        if (state.agents[i].status === 'done') return a;
-
         if (i < agentIdx) return { ...a, status: 'done', expanded: false };
         if (i === agentIdx) {
-          // running vs awaiting comes from backend status
           const status =
             run.status === 'awaiting_intervention' ||
-              run.status === 'awaiting_more_turns'        // ← new
+              run.status === 'awaiting_more_turns'
               ? 'awaiting'
               : 'running';
           return { ...a, status, expanded: true };
@@ -191,10 +258,10 @@ function reducer(state, action) {
         currentAgentIdx: agentIdx,
         issueUrl: derived.issueUrl ?? state.issueUrl,
         runStatus: run.status,
+        turnsUsed: run.turns_used,
         agents,
       };
     }
-
 
 
     case 'POLL_ERROR':

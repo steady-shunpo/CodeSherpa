@@ -1,9 +1,11 @@
 import os
-from llm_utils import call_llm
+from llm_utils import call_llm, MODEL
 import os
 import json
 from datetime import datetime
 import re
+
+
 
 def create_failure_doc(repo_url: str, user_issue: str) -> dict:
     """
@@ -48,11 +50,20 @@ TOOL_NAMES = {
 }
 
 
+import uuid
+from datetime import datetime
+
+
 class BytesEncoder(json.JSONEncoder):
     def default(self, o):
         if isinstance(o, bytes):
             return o.decode('utf-8', errors='replace') # Gracefully handles non-utf8 bytes too
-        return super().default(o)
+        if isinstance(o, (uuid.UUID, datetime)):
+            return str(o)
+        try:
+            return super().default(o)
+        except TypeError:
+            return str(o)
     
 
 def _trim_messages_for_summary(messages: list) -> list:
@@ -91,7 +102,7 @@ def finalize_failure_doc(
     stage: str,
     failure_reason: str,
     messages: list,
-    model: str = "mistralai/mistral-medium-3.5-128b",
+    model: str = MODEL,
 ) -> dict:
     """
     Finalize a failure document, generate a failure summary via LLM,

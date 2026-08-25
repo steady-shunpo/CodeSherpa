@@ -12,7 +12,7 @@ import uuid
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import DateTime, ForeignKey, Integer, LargeBinary, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, ForeignKey, Integer, LargeBinary, String, Text, UniqueConstraint, Index
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
@@ -36,6 +36,7 @@ class RunStatus(str, Enum):
     SUCCEEDED              = "succeeded"             # terminal ✓
     FAILED                 = "failed"                # terminal ✗
     CANCELLED              = "cancelled"             # terminal —
+    PAUSED                 = "paused"
 
 
 class StageEnum(str, Enum):
@@ -193,20 +194,62 @@ class Repograph(Base):
     repo_url:   Mapped[str]   = mapped_column(Text, nullable=False)
     commit_sha: Mapped[str]   = mapped_column(String(40), nullable=False)
 
-    # graph.pkl — the raw pickle bytes your repograph function produces
-    graph_pkl:  Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
-
-    # tags.jsonl — stored as a JSON array (one element per original line)
-    tags_json:  Mapped[list]  = mapped_column(JSONB, nullable=False)
-
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
 
-    # Unique constraint — one graph per (repo, commit) pair
+    symbols: Mapped[list["Symbol"]] = relationship(
+        "Symbol", back_populates="repograph", cascade="all, delete-orphan"
+    )
+    calls: Mapped[list["Call"]] = relationship(
+        "Call", back_populates="repograph", cascade="all, delete-orphan"
+    )
     __table_args__ = (
         UniqueConstraint("repo_url", "commit_sha", name="uq_repograph_repo_commit"),
     )
 
     def __repr__(self) -> str:
         return f"<Repograph repo={self.repo_url} commit={self.commit_sha[:7]}>"
+
+
+class Symbol(Base):
+    __tablename__ = "symbols"
+ 
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    repograph_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("repographs.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    file: Mapped[str] = mapped_column(String, nullable=False)
+    start_line: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_line: Mapped[int] = mapped_column(Integer, nullable=False)
+    signature: Mapped[str | None] = mapped_column(Text, nullable=True)
+    docstring: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    repograph: Mapped["Repograph"] = relationship("Repograph", back_populates="symbols")
+ 
+    __table_args__ = (
+        Index("idx_symbols_graph_name", "repograph_id", "name"),
+        Index("idx_symbols_graph_file", "repograph_id", "file"),
+    )
+ 
+ 
+class Call(Base):
+    __tablename__ = "calls"
+ 
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    repograph_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("repographs.id", ondelete="CASCADE"), nullable=False
+    )
+    caller_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    callee_name: Mapped[str] = mapped_column(String, nullable=False)
+    file: Mapped[str] = mapped_column(String, nullable=False)
+    line: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    repograph: Mapped["Repograph"] = relationship("Repograph", back_populates="calls")
+ 
+    __table_args__ = (
+        Index("idx_calls_graph_caller", "repograph_id", "caller_name"),
+        Index("idx_calls_graph_callee", "repograph_id", "callee_name"),
+    )

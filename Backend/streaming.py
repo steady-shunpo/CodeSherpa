@@ -3,6 +3,7 @@ from typing import Dict
 
 # Global registry: run_id (str) → asyncio.Queue
 _queues: Dict[str, asyncio.Queue] = {}
+_chat_queues: Dict[str, asyncio.Queue] = {}
 _loop: asyncio.AbstractEventLoop = None
 
 
@@ -15,6 +16,12 @@ def get_or_create_queue(run_id: str) -> asyncio.Queue:
     if run_id not in _queues:
         _queues[run_id] = asyncio.Queue()
     return _queues[run_id]
+
+
+def get_or_create_chat_queue(run_id: str) -> asyncio.Queue:
+    if run_id not in _chat_queues:
+        _chat_queues[run_id] = asyncio.Queue()
+    return _chat_queues[run_id]
 
 
 def get_queue(run_id: str) -> asyncio.Queue | None:
@@ -34,6 +41,12 @@ def publish_token(run_id: str, token: str, loop: asyncio.AbstractEventLoop):
         return
     loop.call_soon_threadsafe(queue.put_nowait, token)
 
+
+def publish_chat_token(run_id: str, token: str, loop: asyncio.AbstractEventLoop):
+    queue = get_or_create_chat_queue(run_id)
+    if queue is None:
+        return 
+    loop.call_soon_threadsafe(queue.put_nowait, token)
 
 # Sentinel — signals the SSE endpoint that the stage is done
 STREAM_DONE = "__STREAM_DONE__"

@@ -1,5 +1,5 @@
 from tools import checkpoint_gate
-from llm_utils import run_agent_loop, summarize_failure
+from llm_utils import run_agent_loop, summarize_failure, MODEL
 from sandbox_utils import parse_and_execute, run_remote_command
 
 
@@ -32,17 +32,25 @@ TOOLS (plain text only — no JSON):
    ACTION: read_file("src/foo.py", 1, 50)
    __END__
 
-3. search_file("path", "term")
+2. search_file("path", "term")
+   Search for a term/string in a specific file (grep).
    ACTION: search_file("src/foo.py", "def my_function")
    __END__
 
-4. run_bash_command("cmd")
-   ACTION: run_bash_command("<cmd>")
+3. search_repo("symbol_name")
+   Find where a function, class, or method is defined in the codebase.
+   Returns file path, exact line numbers, signature, and docstring.
+   ACTION: search_repo("parse_header")
    __END__
 
-5. reset_file("path")
-   Resets a file to its original state. Use when you corrupted a file.
-   ACTION: reset_file("<path>")
+4. list_symbols("path")
+   List all symbols (functions, classes, methods) defined in a specific file.
+   ACTION: list_symbols("src/foo.py")
+   __END__
+
+5. line_count("path")
+   Get total line count of a file before reading.
+   ACTION: line_count("src/foo.py")
    __END__
 
 6. edit_file("path", start, end)
@@ -67,6 +75,15 @@ TOOLS (plain text only — no JSON):
    def my_new_method(self):
        pass
    |||
+   __END__
+
+7. reset_file("path")
+   Resets a file to its original state. Use when you corrupted a file.
+   ACTION: reset_file("<path>")
+   __END__
+
+8. run_bash_command("cmd")
+   ACTION: run_bash_command("<cmd>")
    __END__
 
 IMPL_HINT USAGE — follow this if IMPL_HINT is provided:
@@ -106,6 +123,8 @@ THOUGHT: <reasoning>
 ACTION: <tool call>
 __END__
 
+CRITICAL: Do NOT use XML/HTML tags like <tool_call>, <tool_name>, or <tool>. Plain text only.
+
 FORMAT — when test passes:
 THOUGHT: The test now passes.
 FINAL_RESULT:
@@ -113,12 +132,12 @@ STATUS: SUCCESS
 CHANGES_MADE:
 - <file>: <what changed>
 """
-
+import threading
 import asyncio
 def run_implementer(run_id: str, architect_plan: str, test_result: dict, env_summary: str,
-                    env: dict, repo_context: str, sandbox, loop: asyncio.AbstractEventLoop, max_iterations: int = 25,
-                    impl_hint: str = "") -> dict:  # ← add impl_hint parameter
-    model = "mistralai/mistral-medium-3.5-128b"
+                    env: dict, repo_context: str, repograph_id, sandbox, loop: asyncio.AbstractEventLoop, cancel_flag: threading.Event, max_iterations: int = 12,
+                    impl_hint: str = "", feedback: str | None = None) -> dict:  # ← add impl_hint and feedback parameter
+    model = MODEL
     print("\n" + "=" * 50)
     print("🔨 STARTING IMPLEMENTER")
     print("=" * 50)
@@ -153,6 +172,12 @@ def run_implementer(run_id: str, architect_plan: str, test_result: dict, env_sum
             )
         }
     ]
+
+    if feedback:
+        messages.append({
+            "role": "user",
+            "content": f"⚠️ [SUPERVISOR FEEDBACK FROM PREVIOUS ATTEMPT]:\n{feedback}\n\nPlease apply this feedback and fix the implementation."
+        })
 
     def on_done(raw_reply: str, msgs: list):
         print("\n✅ Implementer reports fix complete.")
@@ -192,8 +217,10 @@ def run_implementer(run_id: str, architect_plan: str, test_result: dict, env_sum
         done_token        = "FINAL_RESULT:",
         agent_name        = "🔨 Implementer",
         on_done           = on_done,
+        repograph_id      = repograph_id,
         env               = env,
         loop              = loop,
+        cancel_flag       = cancel_flag,
     )
 
     if run_id:

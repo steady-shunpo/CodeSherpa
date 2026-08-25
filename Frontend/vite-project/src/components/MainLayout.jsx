@@ -5,14 +5,31 @@ import IdleScreen from './IdleScreen';
 import LoadingScreen from './LoadingScreen';
 import ChatPanel from './ChatPanel';
 import PipelinePanel from './PipelinePanel';
+import { useParams } from 'react-router-dom';
+import { useEffect } from 'react';
+
 import { useRunPoller } from '../hooks/useRunPoller';  // ← add
+import { getDoc } from '../utils/api';
 
 
 export default function MainLayout() {
-  const { state } = useApp();
+  const { runId } = useParams();
+  const { state, dispatch } = useApp();
   const { phase } = state;
+  // console.log(runId)
+  useRunPoller(runId);
+  useEffect(() => {
+  if (runId) {
+    getDoc(runId).then(doc => {
+      // console.log("RUN ID CHANGED: ", doc);
+      dispatch({ type: 'LOAD_RUN', payload: doc });
+    });
+  } else {
+    dispatch({ type: 'RESET' });
+  }
+}, [runId]);
 
-  useRunPoller();
+
 
   const showPipeline = phase === 'pipeline';
 

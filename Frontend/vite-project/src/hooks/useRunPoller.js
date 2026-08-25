@@ -2,6 +2,8 @@ import { useEffect, useRef } from 'react';
 import { useApp } from '../store/appStore';
 import { getRun } from '../utils/api';
 import { deriveRunState } from '../utils/statusMap';
+import { useParams } from 'react-router-dom';
+
 
 const POLL_INTERVAL = 6000; // ms
 
@@ -9,19 +11,26 @@ const TERMINAL_STATUSES = new Set([
   'succeeded', 'failed', 'cancelled',
 ]);
 
-export function useRunPoller() {
+export function useRunPoller(runId) {
+
+
   const { state, dispatch } = useApp();
-  const { runId } = state;
+  
   const timerRef = useRef(null);
 
   useEffect(() => {
     // Don't poll if there's no active run
-    if (!runId) return;
+    
+    if (!runId) {
+      console.log("early return")
+      return;
+    }
+    // console.log('continuing')
 
     async function poll() {
       try {
         const run = await getRun(runId);
-        console.log('POLL:', run.status, run.current_stage);
+        console.log('POLL:', run.status, run.current_stage, run.turns_used);
         const derived = deriveRunState(run);
         console.log('DERIVED:', derived);
         console.log('RUN OBJECT:', JSON.stringify(run));
@@ -47,3 +56,5 @@ export function useRunPoller() {
     };
   }, [runId]);
 }
+
+

@@ -1,8 +1,9 @@
 import { useState } from 'react';
 import { useApp } from '../store/appStore';
-import { RichText } from '../utils/text';
+import { RichText, formatAgentStreamText } from '../utils/text';
 import { ChevronDown, CheckCircle2, Circle, Loader2, XCircle, Clock } from 'lucide-react';
 import { resumeRun, continueRun, cancelRun } from '../utils/api';
+import { useParams } from 'react-router-dom';
 
 const STATUS_META = {
   waiting: { icon: Circle, iconClass: 'text-muted-foreground/40', label: 'Waiting', labelClass: 'text-muted-foreground/50' },
@@ -14,7 +15,8 @@ const STATUS_META = {
 
 export default function AgentCard({ agent, idx }) {
   const { state, dispatch } = useApp();
-  const { runId, runStatus } = state;
+  const { runStatus } = state;
+  const { runId } = useParams();
   const [feedbackOpen, setFeedbackOpen] = useState(false);
   const [feedbackText, setFeedbackText] = useState('');
   const [isActing, setIsActing] = useState(false);
@@ -119,10 +121,10 @@ export default function AgentCard({ agent, idx }) {
 
       {/* Stream */}
       {agent.expanded && agent.stream.length > 0 && (
-        <div className="px-4 py-3 border-b border-border">
+        <div className="px-4 py-3 border-b border-border max-h-[420px] overflow-y-auto">
           <RichText
-            text={agent.stream.join('')}
-            className="text-xs text-muted-foreground leading-relaxed"
+            text={formatAgentStreamText(agent.stream.join(''), agent.id)}
+            className="text-xs text-card-foreground/90 leading-relaxed break-words font-sans select-text"
           />
           {agent.status === 'running' && (
             <div className="flex items-center gap-1.5 mt-2">

@@ -2,7 +2,8 @@ import { useState, useRef, useEffect } from 'react';
 import { useApp } from '../store/appStore';
 import { RichText } from '../utils/text';
 import { ArrowUp, Zap, AlertCircle } from 'lucide-react';
-import { sendMessage, getMessages } from '../utils/api';
+import { sendMessage, getMessages, useChatStream } from '../utils/api';
+import { useParams } from 'react-router-dom';
 
 function Message({ msg }) {
   const isUser = msg.role === 'user';
@@ -29,13 +30,28 @@ function Message({ msg }) {
 
 export default function ChatPanel() {
   const { state, dispatch } = useApp();
-  const { messages, phase, runId } = state;
+  const { chatMessages, phase } = state;
+  const { runId } = useParams();
   const [input, setInput] = useState('');
+  const [pendingMessageId, setPendingMessageId] = useState(null);
   const [isSending, setIsSending] = useState(false);
   const bottomRef = useRef(null);
   const textareaRef = useRef(null);
 
+
   const isAwaiting = phase === 'awaiting_intervention';
+
+  useChatStream(
+    runId,
+    pendingMessageId,
+    (chunk) => {
+      dispatch({ type: 'CHAT_STREAM_CHUNK', chunk });
+    },
+    () => {
+      setPendingMessageId(null);
+      setIsSending(false);
+    }
+  );
 
   // Fetch messages whenever runId changes
   useEffect(() => {
@@ -48,7 +64,7 @@ export default function ChatPanel() {
   // Scroll to bottom on new messages
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [chatMessages]);
 
   async function send() {
     const text = input.trim();
@@ -60,12 +76,12 @@ export default function ChatPanel() {
     setIsSending(true);
 
     try {
-      await sendMessage(runId, text);
-      // Response will come via poller / SSE — no need to handle here
+      await sendMessage(runId, text);         // POST, returns immediately
+      setPendingMessageId('msg' + Date.now()); // triggers SSE hook to open
     } catch (e) {
       dispatch({ type: 'ADD_MESSAGE', msg: { id: 'err' + Date.now(), role: 'assistant', content: 'Failed to send message.', ts: Date.now() } });
-    } finally {
       setIsSending(false);
+      setPendingMessageId(null);
     }
   }
 
@@ -88,7 +104,7 @@ export default function ChatPanel() {
       {/* Messages */}
       <div className="flex-1 overflow-y-auto py-6">
         <div className="max-w-2xl mx-auto px-4 flex flex-col gap-4">
-          {messages.map(msg => <Message key={msg.id} msg={msg} />)}
+          {chatMessages.map(msg => <Message key={msg.id} msg={msg} />)}
           <div ref={bottomRef} />
         </div>
       </div>

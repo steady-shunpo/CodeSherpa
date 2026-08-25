@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { Zap, ArrowRight } from 'lucide-react';
 import { useApp } from '../store/appStore';
 import { createRun } from '../utils/api';
-
+import { useNavigate } from 'react-router-dom';
 const EXAMPLES = [
   'https://github.com/psf/black/issues/4430',   // keep your real examples here
 ];
@@ -11,6 +11,7 @@ export default function IdleScreen() {
   const { dispatch } = useApp();
   const [url, setUrl] = useState('');
   const [error, setError] = useState('');
+  const navigate = useNavigate();
 
   async function handleSubmit() {
     const trimmed = url.trim();
@@ -20,12 +21,18 @@ export default function IdleScreen() {
       return;
     }
     setError('');
+    console.log(0)
     dispatch({ type: 'START_LOADING', url: trimmed });
-
+    console.log(1)
     try {
-      const data = await createRun(trimmed);
-      dispatch({ type: 'SET_RUN_ID', runId: data.run_id });
+      const run = await createRun(trimmed);
+      console.log(2)
+      dispatch({ type: 'RUN_CREATED', run });
+      console.log(run.id)
+      navigate(`/runs/${run.id}`);
+      console.log("navigated")
     } catch (e) {
+      console.error('CREATE RUN ERROR:', e);
       dispatch({ type: 'LOADING_ERROR', message: e.message });
     }
   }
