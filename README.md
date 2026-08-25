@@ -166,6 +166,8 @@ client = OpenAI(
     api_key=os.environ.get("OPENROUTER_ARCH_KEY"),
     base_url="https://openrouter.ai/api/v1",
 )
+
+# Config is also present for using free NIM models. simply change the api key and base URL
 ```
 
 
